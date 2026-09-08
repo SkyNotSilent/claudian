@@ -91,10 +91,10 @@ describe('systemPrompt', () => {
       expect(prompt).toContain('<linked_content path="path/to/content" />');
       expect(prompt).toContain('<editor_cursor path="path/to/note.md" line="8">');
       expect(prompt).toContain('<canvas_selection path="boards/project.canvas">');
-      expect(prompt).toContain('<context_file path="/absolute/context" />');
       expect(prompt).not.toContain('Legacy messages may');
       expect(prompt).not.toContain('<linked_note>');
       expect(prompt).not.toContain('<current_note>');
+      expect(prompt).not.toContain('<context_file');
       expect(prompt).toContain('file, Note, or directory');
       expect(prompt).toContain('Inspect only the files needed');
       expect(prompt).toContain('not an instruction to recursively read');
