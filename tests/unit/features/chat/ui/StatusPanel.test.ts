@@ -185,7 +185,6 @@ class MockElement {
     if (
       this.classList.has('claudian-status-panel-todos')
       || this.classList.has('claudian-status-panel-content')
-      || this.classList.has('claudian-tool-content')
     ) {
       this.style.display = 'block';
       return;
