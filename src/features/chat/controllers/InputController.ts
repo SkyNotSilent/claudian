@@ -325,7 +325,7 @@ export class InputController {
       if (shouldUseInput) {
         inputEl.value = '';
       }
-      await this.executeBuiltInCommand(builtInCmd.command, builtInCmd.args);
+      await this.executeBuiltInCommand(builtInCmd.command);
       return;
     }
 
@@ -1980,7 +1980,7 @@ export class InputController {
   // Built-in Commands
   // ============================================
 
-  private async executeBuiltInCommand(command: BuiltInCommand, args: string): Promise<void> {
+  private async executeBuiltInCommand(command: BuiltInCommand): Promise<void> {
     const { conversationController } = this.deps;
     const capabilities = this.getActiveCapabilities();
 

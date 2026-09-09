@@ -28,8 +28,6 @@ export interface BuiltInCommand {
   aliases?: string[];
   description: string;
   action: BuiltInCommandAction;
-  /** Whether this command accepts arguments. */
-  hasArgs?: boolean;
   /** Hint for arguments shown in dropdown (e.g., "path"). */
   argumentHint?: string;
   /** When set, provider capabilities must expose this feature. */

@@ -150,11 +150,10 @@ describe('builtInCommands', () => {
       expect(resumeCmd?.description).toBe('Resume a previous conversation');
     });
 
-    it('has fork command without args', () => {
+    it('has fork command', () => {
       const forkCmd = BUILT_IN_COMMANDS.find((c) => c.name === 'fork');
       expect(forkCmd).toBeDefined();
       expect(forkCmd?.action).toBe('fork');
-      expect(forkCmd?.hasArgs).toBeUndefined();
     });
 
     it('has a Codex-only fast command', () => {
