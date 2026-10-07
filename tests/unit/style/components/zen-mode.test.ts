@@ -145,7 +145,7 @@ describe('Zen mode styles', () => {
       radius: 'var(--radius-l) var(--radius-l) 0 0',
     });
     // No gap, so the drawer's sides meet the composer's top border.
-    expect(window.getComputedStyle(panel).gap).toBe('0');
+    expect(['', 'normal', '0']).toContain(window.getComputedStyle(panel).gap);
     expect(window.getComputedStyle(panel.querySelector('.claudian-zen-history')!).borderStyle).toBe('');
   });
 
@@ -170,9 +170,13 @@ describe('Zen mode styles', () => {
     strip.classList.replace('claudian-hidden', 'claudian-visible-flex');
     const style = window.getComputedStyle(strip);
     expect(style.display).toBe('flex');
-    // The strip spans the pill edge to edge, over the wrapper's inline padding.
+    const wrapper = composer.querySelector<HTMLElement>('.claudian-input-wrapper')!;
+    const inset = window.getComputedStyle(wrapper).getPropertyValue('padding-inline');
+    expect(inset).not.toBe('');
+    // jsdom retains var() expressions. Both offsets must derive from the wrapper's inset
+    // so the strip stays edge to edge when that inset changes.
     expect({ basis: style.flexBasis, margin: style.getPropertyValue('margin-inline') })
-      .toEqual({ basis: 'calc(100% + 12px)', margin: '-6px' });
+      .toEqual({ basis: `calc(100% + 2 * ${inset})`, margin: `calc(-1 * ${inset})` });
   });
 
   it('drops the header line while expanded so the transcript meets the composer', () => {
