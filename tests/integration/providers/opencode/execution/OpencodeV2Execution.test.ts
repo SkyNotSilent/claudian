@@ -41,6 +41,7 @@ const server = http.createServer(async (req, res) => {
       : [{ id: 'builtin', providerID: 'opencode', name: 'Builtin', enabled: true, variants: [] }] })); return;
   }
   if (route === '/api/command') { res.end(JSON.stringify({ data: [{ name: 'review', description: 'Review' }] })); return; }
+  if (route === '/api/skill') { res.end(JSON.stringify({ data: [{ id: 'writing', name: 'writing', path: '/skills/writing/SKILL.md', content: '' }, { id: 'writing.probe', name: 'writing.probe', path: '/skills/writing.probe/SKILL.md', content: '' }] })); return; }
   if (route === '/api/form') {
     const snapshot = [...ownedForms];
     if (settleInventory) {
@@ -285,11 +286,21 @@ function request(text = '/review changes'): ProviderExecutionRequest {
   };
 }
 
+const writingSkill = { skills: [{ id: 'writing', mention: { start: 0, end: 8, text: '/writing' } }] };
+
 it.each([
-  ['', 'prompt', ''],
-  ['Inspect these images', 'prompt', 'Inspect these images'],
-  ['/review these images', 'command', 'these images'],
-])('sends images through the native HTTP boundary for %j', async (text, route, nativeText) => {
+  ['', 'prompt', '', {}],
+  ['Inspect these images', 'prompt', 'Inspect these images', {}],
+  ['/review these images', 'command', 'these images', {}],
+  ['/writing these images', 'prompt', '/writing these images', writingSkill],
+  ['Use /writing on these images', 'prompt', 'Use /writing on these images', { skills: [{ id: 'writing', mention: { start: 4, end: 12, text: '/writing' } }] }],
+  ['Use /writing/draft.md and /writingx', 'prompt', 'Use /writing/draft.md and /writingx', {}],
+  ['Use /writing.probe, then /writing.', 'prompt', 'Use /writing.probe, then /writing.', { skills: [
+    { id: 'writing.probe', mention: { start: 4, end: 18, text: '/writing.probe' } },
+    { id: 'writing', mention: { start: 25, end: 33, text: '/writing' } },
+  ] }],
+  ['/unknown these images', 'prompt', '/unknown these images', {}],
+])('sends images through the native HTTP boundary for %j', async (text, route, nativeText, attachments) => {
   const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
   try {
     const events: ProviderExecutionEvent[] = [];
@@ -316,6 +327,7 @@ it.each([
         ...(route === 'command' ? nativeIdentity.command : nativeIdentity.prompt),
         text: nativeText,
         files: [{ uri: 'data:image/png;base64,aGVsbG8=' }, { uri: 'data:image/webp;base64,d29ybGQ=' }],
+        ...attachments,
       },
     });
   } finally { await f.dispose(); }
@@ -542,6 +554,24 @@ describe('native steering', () => {
         files: [{ uri: 'data:image/png;base64,aW1hZ2U=' }],
       });
       expect(events.some(event => event.type === 'context_compacted')).toBe(false);
+    } finally { await f.dispose(); }
+  });
+
+  it('attaches a typed skill to steered input', async () => {
+    const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
+    try {
+      const events: ProviderExecutionEvent[] = [];
+      let admission: Promise<boolean> | undefined;
+      for await (const event of f.session.execute(request('steer')).events) {
+        events.push(event);
+        if (event.type === 'text_delta' && event.text === 'Working') admission = steer(f, 'Now apply /writing');
+      }
+      expect(await admission).toBe(true);
+      const echoed = events.flatMap(event => event.type === 'text_delta' && event.text !== 'Working' ? [event.text] : []).join('');
+      expect(JSON.parse(echoed)).toEqual({
+        id: expect.any(String), delivery: 'steer', text: 'Now apply /writing',
+        skills: [{ id: 'writing', mention: { start: 10, end: 18, text: '/writing' } }],
+      });
     } finally { await f.dispose(); }
   });
 
@@ -914,6 +944,22 @@ it('executes a selected title model through the real resolver and native backend
   }
 });
 
+
+it('attaches only skills the user typed when the prompt carries history and captured context', async () => {
+  const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute({
+      ...request('Polish with /writing'),
+      conversationHistory: [{ id: 'old-user', role: 'user', content: 'Earlier /writing draft', timestamp: testDate().getTime() }],
+      context: { selections: [{ kind: 'editor', selection: { notePath: 'note.md', mode: 'selection', selectedText: 'Try /writing later' } }] },
+    }).events) events.push(event);
+    const received = JSON.parse(events.flatMap(event => event.type === 'text_delta' ? [event.text] : []).join(''));
+    const start = received.body.text.indexOf('User: Polish with /writing') + 'User: Polish with '.length;
+    expect(start).toBeGreaterThan('User: Polish with '.length);
+    expect(received.body.skills).toEqual([{ id: 'writing', mention: { start, end: start + 8, text: '/writing' } }]);
+  } finally { await f.dispose(); }
+});
 
 it('sends hidden session reference paths through the HTTP v2 prompt boundary', async () => {
   const f = createFixture(false, undefined, 'ECHO_PROMPT=1');

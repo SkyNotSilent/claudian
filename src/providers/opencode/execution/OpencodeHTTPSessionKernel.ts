@@ -11,6 +11,7 @@ import { projectOpencodeFormQuestions } from '../http/OpencodeHTTPForms';
 import type { OpencodeServerLease, OpencodeServerService } from '../http/OpencodeServerService';
 import { OpencodeShellOutput } from '../http/OpencodeShellOutput';
 import { normalizeOpencodeToolInput, normalizeOpencodeToolName, normalizeOpencodeToolResult, normalizeOpencodeToolResultDetails } from '../normalization/opencodeToolNormalization';
+import type { OpencodeTextRange } from '../runtime/buildOpencodePrompt';
 import { AUX_AGENT_IDS, buildOpencodeSystemPrompt, getSystemPromptSettings, OPENCODE_BUILD_AGENT_ID } from '../runtime/OpencodeExecutionAgents';
 import {
   type OpencodeKernelConnectOptions,
@@ -53,6 +54,7 @@ export class OpencodeHTTPSessionKernel implements OpencodeSessionKernel {
   private pending: PendingPrompt | null = null;
   private readonly inboxInputs = new Map<string, PendingInboxInput>();
   private cancellation: Promise<unknown> | null = null;
+  private steerOrder: Promise<void> = Promise.resolve();
   private readonly idleWaiters = new Set<() => void>();
 
   private agents: Record<string, string> = {};
@@ -147,15 +149,19 @@ export class OpencodeHTTPSessionKernel implements OpencodeSessionKernel {
     this.autoApprove = this.profile === 'managed' && enabled;
   }
 
-  async prompt(request: ACPPromptRequest): Promise<{ stopReason: 'end_turn' | 'cancelled'; userMessageId?: string }> {
+  async prompt(request: ACPPromptRequest, userText?: OpencodeTextRange | null): Promise<{ stopReason: 'end_turn' | 'cancelled'; userMessageId?: string }> {
     if (this.pending) throw new Error('OpenCode already has an active request.');
     const { text, files } = toNativeInput(request);
     const compact = parseCompactCommand(text);
     if (compact?.instructions) throw new Error('/compact does not accept arguments');
     const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text);
-    // Commands can change while this kernel keeps its native session and server.
-    const catalog = match && !compact ? await this.requireClient().request<{ data: Array<{ name: string }> }>('/api/command') : null;
+    // Commands and skills can change while this kernel keeps its native session and server.
+    const [catalog, skills] = compact ? [null, []] : await Promise.all([
+      match ? this.requireClient().request<{ data: Array<{ name: string }> }>('/api/command') : null,
+      this.resolveSkillMentions(text, userText),
+    ]);
     const command = match && catalog?.data.some(command => command.name === match[1]) ? match : null;
+    const skill = !command && skills.length ? skills : null;
     const kind = compact ? 'compact' : command ? 'command' : 'prompt';
     const previousMessage = command ? await this.latestMessage(request.sessionId) : undefined;
     let resolve!: PendingPrompt['resolve'];
@@ -168,7 +174,7 @@ export class OpencodeHTTPSessionKernel implements OpencodeSessionKernel {
     void completion.catch(() => undefined);
     try {
       const admission = this.requireClient().request<{ data?: { id?: string } }>(`/api/session/${encodeURIComponent(request.sessionId)}/${kind}`, {
-        method: 'POST', ...(command ? { timeoutMs: 0 } : {}), body: compact ? { id: pending.inputId } : { ...(command ? { name: command[1] } : { id: pending.inputId }), text: command ? command[2] ?? '' : text, ...(files.length ? { files } : {}) },
+        method: 'POST', ...(command ? { timeoutMs: 0 } : {}), body: compact ? { id: pending.inputId } : { ...(command ? { name: command[1] } : { id: pending.inputId }), text: command ? command[2] ?? '' : text, ...(files.length ? { files } : {}), ...(skill ? { skills: skill } : {}) },
       });
       if (compact) this.inboxInputs.set(pending.inputId!, {
         kind: 'compact', recall: null,
@@ -205,24 +211,53 @@ export class OpencodeHTTPSessionKernel implements OpencodeSessionKernel {
    * steer is still recallable, and one left behind an interrupt would
    * otherwise leak into the next prompt.
    */
-  async steer(request: ACPPromptRequest): Promise<boolean> {
+  async steer(request: ACPPromptRequest, userText?: OpencodeTextRange | null): Promise<boolean> {
     const pending = this.pending;
     if (!pending?.steerable || pending.idle || this.cancellation || this.disposed || request.sessionId !== this.sessionId) return false;
     const { text, files } = toNativeInput(request);
+    // Steers reach the native inbox in submission order, whatever their mention lookup costs.
+    const previous = this.steerOrder;
+    let release!: () => void;
+    const slot = new Promise<void>(resolve => { release = resolve; });
+    // A failed lookup releases its slot early, but successors still wait for its predecessors.
+    this.steerOrder = previous.then(() => slot);
+    let admission: Promise<InboxAdmission>;
     const id = nativeMessageId();
-    // Register before admission: delivery can be announced before the HTTP response.
-    const admission = this.requireClient().request(`/api/session/${encodeURIComponent(request.sessionId)}/prompt`, {
-      method: 'POST', body: { id, text, ...(files.length ? { files } : {}), delivery: 'steer' },
-    }).then<InboxAdmission, InboxAdmission>(
-      () => 'admitted',
-      // A client error is a definite native refusal; anything else may have been admitted.
-      error => error instanceof OpencodeHTTPError && error.status >= 400 && error.status < 500 ? 'refused' : 'unknown',
-    );
+    try {
+      const skills = await this.resolveSkillMentions(text, userText);
+      await previous;
+      if (this.pending !== pending || pending.idle || this.cancellation || this.disposed) return false;
+      // Register before admission: delivery can be announced before the HTTP response.
+      admission = this.requireClient().request(`/api/session/${encodeURIComponent(request.sessionId)}/prompt`, {
+        method: 'POST', body: { id, text, ...(files.length ? { files } : {}), ...(skills.length ? { skills } : {}), delivery: 'steer' },
+      }).then<InboxAdmission, InboxAdmission>(
+        () => 'admitted',
+        // A client error is a definite native refusal; anything else may have been admitted.
+        error => error instanceof OpencodeHTTPError && error.status >= 400 && error.status < 500 ? 'refused' : 'unknown',
+      );
+    } finally { release(); }
     const delivery = new Promise<boolean>((resolve, reject) => { this.inboxInputs.set(id, { kind: 'steer', text, admission, resolve, reject, recall: null }); });
     const outcome = await admission;
     if (outcome === 'refused') this.settleInboxInput(id, false);
     else if (outcome === 'unknown' || this.pending !== pending) void this.recallInboxInputs();
     return delivery;
+  }
+
+  /** OpenCode attaches skills only from explicit mentions; it does not parse prompt text. */
+  private async resolveSkillMentions(text: string, userText?: OpencodeTextRange | null): Promise<NativeSkillMention[]> {
+    const typed = userText ? text.slice(userText.start, userText.end) : '';
+    if (!typed.includes('/')) return [];
+    const catalog = await this.requireClient().request<{ data: Array<{ id: string }> }>('/api/skill')
+      .catch((error: unknown) => { if (error instanceof OpencodeHTTPError && error.status === 404) return { data: [] }; throw error; });
+    // Skill IDs may contain punctuation, so the longest catalog ID followed only by trailing punctuation wins.
+    const ids = catalog.data.map(skill => skill.id).filter(Boolean).sort((a, b) => b.length - a.length);
+    return [...typed.matchAll(SLASH_TOKEN)].flatMap(match => {
+      const token = match[1];
+      const id = ids.find(id => token.startsWith(id) && TRAILING_PUNCTUATION.test(token.slice(id.length)));
+      if (!id) return [];
+      const start = userText!.start + match.index;
+      return [{ id, mention: { start, end: start + id.length + 1, text: `/${id}` } }];
+    });
   }
 
   cancel(sessionId: string): void {
@@ -611,6 +646,15 @@ export class OpencodeHTTPSessionKernel implements OpencodeSessionKernel {
       workspaceRoot,
     });
   }
+}
+
+// A whitespace-delimited `/token`; paths and longer names are not mentions of a shorter ID.
+const SLASH_TOKEN = /(?<!\S)\/(\S+)/g;
+const TRAILING_PUNCTUATION = /^[.,;:!?)\]}"']*$/;
+
+interface NativeSkillMention {
+  id: string;
+  mention: { start: number; end: number; text: string };
 }
 
 function toNativeInput(request: ACPPromptRequest): { text: string; files: Array<{ uri: string }> } {
