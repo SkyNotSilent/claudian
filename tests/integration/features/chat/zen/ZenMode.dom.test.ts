@@ -130,6 +130,10 @@ async function createZenFixture(options: { enabled?: boolean; ready?: boolean } 
   const zen = new ZenModeController({
     app,
     isEnabled: (): boolean => settingsCoordinator.getCommittedSettings().enableZenMode,
+    getPosition: () => settingsCoordinator.getCommittedSettings().zenModePosition,
+    savePosition: (position) => {
+      void settingsCoordinator.mutate((draft) => { draft.zenModePosition = position; });
+    },
   });
   const settingsCoordinator: SettingsCoordinator<ClaudianSettings> = new SettingsCoordinator(
     settings,
@@ -834,6 +838,174 @@ it('collapses the expanded transcript on a click or focus move elsewhere in Obsi
   expect(hide.getAttribute('aria-expanded')).toBe('true');
   fireEvent.focusOut(inputEl, { relatedTarget: noteEditor });
   expect(hide.getAttribute('aria-expanded')).toBe('false');
+});
+
+it('moves the panel by its grip, docks it magnetically, and remembers where it was left', async () => {
+  const observers: Array<{ callback: ResizeObserverCallback; targets: Set<Element> }> = [];
+  globalThis.ResizeObserver = class {
+    readonly #entry: { callback: ResizeObserverCallback; targets: Set<Element> };
+    constructor(callback: ResizeObserverCallback) {
+      this.#entry = { callback, targets: new Set() };
+      observers.push(this.#entry);
+    }
+    observe(target: Element) { this.#entry.targets.add(target); }
+    unobserve(target: Element) { this.#entry.targets.delete(target); }
+    disconnect() { this.#entry.targets.clear(); }
+  } as unknown as typeof ResizeObserver;
+  const resize = (target: Element) => {
+    for (const { callback, targets } of observers) {
+      if (targets.has(target)) callback([], {} as ResizeObserver);
+    }
+  };
+  // jsdom lacks PointerEvent, so fireEvent would dispatch plain events without pointer coordinates.
+  const originalPointerEvent = window.PointerEvent;
+  window.PointerEvent = class extends MouseEvent {
+    readonly pointerId: number;
+    constructor(type: string, init: PointerEventInit = {}) {
+      super(type, init);
+      this.pointerId = init.pointerId ?? 0;
+    }
+  } as unknown as typeof PointerEvent;
+  cleanups.push(() => { window.PointerEvent = originalPointerEvent; });
+  const { rootEl, rightSplit, setCollapsed, settingsCoordinator, noteEditor } = await createZenFixture();
+  // jsdom has no layout: a 1000x800 central workspace holding a 600x100 panel, without zen styles.
+  // A 584x60 composer sits 8px inside the panel's bottom, which follows the bottom offset; a
+  // drawer, when shown, sits on it, 526px wide.
+  Object.defineProperty(rootEl, 'clientWidth', { configurable: true, value: 1000 });
+  Object.defineProperty(rootEl, 'clientHeight', { configurable: true, value: 800 });
+  jest.spyOn(rootEl, 'getBoundingClientRect').mockImplementation(() => ({ top: 0, bottom: 800 } as DOMRect));
+  let panelHeight = 100;
+  let drawerHeight = 0;
+  const stubPanel = (panel: HTMLElement) => {
+    const composerBottom = () => 800 - Number.parseFloat(panel.style.getPropertyValue('--claudian-zen-offset-y') || '0');
+    jest.spyOn(panel, 'getBoundingClientRect').mockImplementation(() => ({
+      left: 200, right: 800, top: composerBottom() + 8 - panelHeight, bottom: composerBottom() + 8,
+      width: 600, height: panelHeight,
+    } as DOMRect));
+    jest.spyOn(panel.querySelector<HTMLElement>('.claudian-zen-composer')!, 'getBoundingClientRect')
+      .mockImplementation(() => ({ left: 208, right: 792, top: composerBottom() - 60, bottom: composerBottom() } as DOMRect));
+    jest.spyOn(panel.querySelector<HTMLElement>('.claudian-zen-drawer')!, 'getBoundingClientRect')
+      .mockImplementation(() => ({
+        left: 237, right: 763, top: composerBottom() - 60 - drawerHeight, bottom: composerBottom() - 60,
+        height: drawerHeight,
+      } as DOMRect));
+  };
+  // Corner points of the hint outline, relative to the panel box; zen styles add no gap or radii here.
+  const outlinePoints = () => {
+    const d = rootEl.querySelector('.claudian-zen-dock-hint-outline')?.getAttribute('d') ?? '';
+    return (d.match(/[MLA][^MLAZ]*/g) ?? []).map((command) => {
+      const values = command.slice(1).trim().split(/[\s,]+/).map(Number);
+      return values.slice(-2);
+    });
+  };
+  const offset = (panel: HTMLElement) => [
+    panel.style.getPropertyValue('--claudian-zen-offset-x'),
+    panel.style.getPropertyValue('--claudian-zen-offset-y'),
+  ];
+  const savedPosition = () => settingsCoordinator.getCommittedSettings().zenModePosition;
+  const drag = (grip: HTMLElement, from: [number, number], to: [number, number]) => {
+    fireEvent.pointerDown(grip, { button: 0, pointerId: 1, clientX: from[0], clientY: from[1] });
+    fireEvent.pointerMove(document, { pointerId: 1, clientX: to[0], clientY: to[1] });
+    fireEvent.pointerUp(document, { pointerId: 1, clientX: to[0], clientY: to[1] });
+  };
+
+  setCollapsed(rightSplit, true);
+  let panel = zenPanel()!;
+  stubPanel(panel);
+  const grip = within(panel).getByRole('button', { name: 'Move chat panel' });
+  expect(await axe(grip)).toHaveNoViolations();
+  expect(offset(panel)).toEqual(['0px', '0px']);
+
+  // Dragging left beyond the edge stops at the workspace's side; upward is a positive bottom offset.
+  drag(grip, [500, 700], [100, 400]);
+  expect(offset(panel)).toEqual(['-200px', '300px']);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: -0.2, y: 0.375 }));
+  expect(panel.classList.contains('claudian-zen--opens-below')).toBe(false);
+
+  // Near the top, composer menus open downward instead of past the workspace edge.
+  drag(grip, [0, 0], [0, -500]);
+  expect(offset(panel)).toEqual(['-200px', '700px']);
+  expect(panel.classList.contains('claudian-zen--opens-below')).toBe(true);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: -0.2, y: 0.875 }));
+
+  // A taller panel slides down to stay inside the workspace, then returns to the remembered spot.
+  panelHeight = 300;
+  resize(panel);
+  expect(offset(panel)).toEqual(['-200px', '500px']);
+  panelHeight = 100;
+  resize(panel);
+  expect(offset(panel)).toEqual(['-200px', '700px']);
+  expect(savedPosition()).toEqual({ x: -0.2, y: 0.875 });
+
+  // Reattaching restores the remembered position.
+  setCollapsed(rightSplit, false);
+  noteEditor.focus();
+  setCollapsed(rightSplit, true);
+  panel = zenPanel()!;
+  stubPanel(panel);
+  expect(offset(panel)).toEqual(['-200px', '700px']);
+
+  // While dragging, a hint marks the dock and lights up once the panel is close enough to snap.
+  const reopenedGrip = within(panel).getByRole('button', { name: 'Move chat panel' });
+  const hint = () => rootEl.querySelector<HTMLElement>('.claudian-zen-dock-hint');
+  expect(hint()).toBeNull();
+  fireEvent.pointerDown(reopenedGrip, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+  fireEvent.pointerMove(document, { pointerId: 1, clientX: 100, clientY: 300 });
+  expect(hint()?.getAttribute('aria-hidden')).toBe('true');
+  expect([hint()!.style.width, hint()!.style.height]).toEqual(['600px', '100px']);
+  // Without a drawer, the outline is the composer alone.
+  expect(Math.min(...outlinePoints().map(([, y]) => y))).toBe(32);
+  expect(hint()!.classList.contains('claudian-zen-dock-hint--active')).toBe(false);
+  expect(panel.classList.contains('claudian-zen--snapped')).toBe(false);
+
+  // Released close to its dock, the panel snaps into it and forgets the free position.
+  fireEvent.pointerMove(document, { pointerId: 1, clientX: 190, clientY: 690 });
+  expect(offset(panel)).toEqual(['0px', '0px']);
+  expect(hint()!.classList.contains('claudian-zen-dock-hint--active')).toBe(true);
+  expect(panel.classList.contains('claudian-zen--snapped')).toBe(true);
+  fireEvent.pointerUp(document, { pointerId: 1, clientX: 190, clientY: 690 });
+  expect(hint()).toBeNull();
+  expect(panel.classList.contains('claudian-zen--snapped')).toBe(false);
+  expect(offset(panel)).toEqual(['0px', '0px']);
+  await waitFor(() => expect(savedPosition()).toBeNull());
+
+  // The grip also moves by keyboard, and Home docks it again.
+  reopenedGrip.focus();
+  fireEvent.keyDown(reopenedGrip, { key: 'ArrowUp' });
+  fireEvent.keyDown(reopenedGrip, { key: 'ArrowRight', shiftKey: true });
+  expect(offset(panel)).toEqual(['64px', '16px']);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: 0.064, y: 0.02 }));
+  fireEvent.keyDown(reopenedGrip, { key: 'Home' });
+  expect(offset(panel)).toEqual(['0px', '0px']);
+  await waitFor(() => expect(savedPosition()).toBeNull());
+
+  // Tall history lifts the panel's middle, but the composer stays low, so its menus keep opening upward.
+  panelHeight = 400;
+  drag(reopenedGrip, [0, 0], [0, -250]);
+  expect(offset(panel)).toEqual(['0px', '250px']);
+  expect(panel.classList.contains('claudian-zen--opens-below')).toBe(false);
+
+  // Growth during a drag is rechecked on release, so the panel never stays past the top edge.
+  panelHeight = 100;
+  resize(panel);
+  fireEvent.pointerDown(reopenedGrip, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+  fireEvent.pointerMove(document, { pointerId: 1, clientX: 0, clientY: -500 });
+  expect(offset(panel)).toEqual(['0px', '700px']);
+  panelHeight = 300;
+  resize(panel);
+  fireEvent.pointerUp(document, { pointerId: 1, clientX: 0, clientY: -500 });
+  expect(offset(panel)).toEqual(['0px', '500px']);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: 0, y: 0.625 }));
+
+  // With a drawer above the composer, the hint takes the panel's stepped outline.
+  panelHeight = 100;
+  drawerHeight = 24;
+  resize(panel);
+  fireEvent.pointerDown(reopenedGrip, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+  const points = outlinePoints();
+  expect(Math.min(...points.map(([, y]) => y))).toBe(8);
+  expect(points).toEqual(expect.arrayContaining([[37, 32], [563, 32], [8, 92], [592, 92]]));
+  fireEvent.pointerUp(document, { pointerId: 1, clientX: 0, clientY: 0 });
 });
 
 it('keeps the preview line on the main chat while a side chat is selected', async () => {
