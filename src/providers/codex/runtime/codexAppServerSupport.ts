@@ -1,15 +1,16 @@
+import { getEnhancedPath, parseEnvironmentVariables } from '@/core/process/env';
+
 import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import type {
   ProviderId,
   ProviderTransitionOwnerContext,
 } from '../../../core/providers/types';
-import { getEnhancedPath, parseEnvironmentVariables } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
 import type { InitializeResult } from './codexAppServerTypes';
 import { resolveCodexExecutionTargetAsync } from './CodexExecutionTargetResolver';
 import { buildCodexLaunchSpec } from './CodexLaunchSpecBuilder';
 import type { CodexLaunchSpec } from './codexLaunchTypes';
-import type { CodexRpcTransport } from './CodexRpcTransport';
+import type { CodexRPCTransport } from './CodexRPCTransport';
 
 const CODEX_APP_SERVER_CLIENT_INFO = Object.freeze({
   name: 'claudian',
@@ -61,7 +62,7 @@ export async function resolveCodexAppServerLaunchSpec(
 }
 
 export async function initializeCodexAppServerTransport(
-  transport: CodexRpcTransport,
+  transport: CodexRPCTransport,
 ): Promise<InitializeResult> {
   const result = await transport.request<InitializeResult>('initialize', {
     clientInfo: CODEX_APP_SERVER_CLIENT_INFO,

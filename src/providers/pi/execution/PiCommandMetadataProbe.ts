@@ -1,11 +1,11 @@
+import { parseEnvironmentVariables } from '@/core/process/env';
 import { OwnedProbeRegistry } from '@/core/providers/metadata/OwnedProbeRegistry';
 import { ProviderTransitionFence } from '@/core/providers/metadata/ProviderTransitionFence';
 import { getRuntimeEnvironmentText } from '@/core/providers/providerEnvironment';
 import type { ProviderHost } from '@/core/providers/ProviderHost';
 import type { SlashCommand } from '@/core/types';
-import { parseEnvironmentVariables } from '@/utils/env';
 
-import { buildPiLaunchSpec } from '../runtime/PiLaunchSpec';
+import { buildPiLaunchSpec } from '../runtime/PiLaunchSpecBuilder';
 import { getPiProviderSettings } from '../settings';
 import {
   createPiExecutionKernel,
@@ -16,9 +16,14 @@ import {
 const ABORT_MESSAGE = 'Pi command metadata probe aborted';
 const DISPOSED_MESSAGE = 'Pi command metadata probe is disposed.';
 
+type PiCommandMetadataProbeSession = {
+  readonly getPushedCommands: () => SlashCommand[] | null;
+  readonly kernel: PiExecutionKernel;
+};
+
 export class PiCommandMetadataProbe {
   private disposeFlight: Promise<void> | null = null;
-  private readonly probes: OwnedProbeRegistry<PiExecutionKernel>;
+  private readonly probes: OwnedProbeRegistry<PiCommandMetadataProbeSession>;
   private readonly transitionFence = new ProviderTransitionFence({
     abortMessage: ABORT_MESSAGE,
   });
@@ -28,9 +33,9 @@ export class PiCommandMetadataProbe {
     private readonly createKernel: PiExecutionKernelFactory =
       createPiExecutionKernel,
   ) {
-    this.probes = new OwnedProbeRegistry({
+    this.probes = new OwnedProbeRegistry<PiCommandMetadataProbeSession>({
       abortMessage: ABORT_MESSAGE,
-      dispose: kernel => kernel.shutdown(),
+      dispose: probe => probe.kernel.shutdown(),
       unavailableError: () => new Error(DISPOSED_MESSAGE),
     });
   }
@@ -60,26 +65,40 @@ export class PiCommandMetadataProbe {
           noSession: true,
           settings: getPiProviderSettings(this.host.settings),
         });
-        return this.createKernel(
+        let pushedCommands: SlashCommand[] | null = null;
+        const kernel = this.createKernel(
           launchSpec,
           {
             onClose: () => undefined,
-            onEvent: () => undefined,
+            onEvent: (event) => {
+              const record = getRecord(event);
+              if (record.type !== 'available_commands_update') return;
+              pushedCommands = normalizePiRuntimeCommands(
+                Array.isArray(record.commands) ? record : record.data,
+              );
+            },
             onExtensionChunk: () => undefined,
             onExtensionRequest: () => false,
           },
           null,
         );
+        return { kernel, getPushedCommands: () => pushedCommands };
       },
-      initialize: kernel => kernel.start(),
-      query: async (kernel, ownedSignal) => {
-        const response = await kernel.request<unknown>(
-          'get_commands',
-          {},
-          10_000,
-          ownedSignal,
-        );
-        return normalizePiRuntimeCommands(response);
+      initialize: probe => probe.kernel.start(),
+      query: async (probe, ownedSignal) => {
+        try {
+          const response = await probe.kernel.request<unknown>(
+            'get_commands',
+            {},
+            10_000,
+            ownedSignal,
+          );
+          return normalizePiRuntimeCommands(response);
+        } catch (error) {
+          const pushedCommands = probe.getPushedCommands();
+          if (pushedCommands) return pushedCommands;
+          throw error;
+        }
       },
     }, signal);
   }

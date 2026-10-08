@@ -1,7 +1,10 @@
 import type {
   CitationGroup,
-  SDKToolUseResult,
+  SubagentInfo,
+  SubagentProgress,
   ToolProviderPayload,
+  ToolResultDetails,
+  TurnStats,
   UsageInfo,
 } from '../types';
 import type { ProviderSessionSnapshot } from './ProviderSessionSnapshot';
@@ -139,7 +142,8 @@ export type ProviderToolOutputEvent = ProviderEventBase<
   ProviderToolIdentity & {
     readonly content: string;
     readonly isError?: boolean;
-    readonly toolUseResult?: SDKToolUseResult;
+    /** Latest structured snapshot of the running tool, replacing earlier ones. */
+    readonly resultDetails?: ToolResultDetails;
     readonly providerPayload?: ToolProviderPayload;
   };
 
@@ -152,7 +156,8 @@ export type ProviderToolCompletedEvent = ProviderEventBase<
     readonly isError?: boolean;
     /** Authoritative provider outcome; never infer this from result content. */
     readonly isBlocked?: boolean;
-    readonly toolUseResult?: SDKToolUseResult;
+    /** Structured result data the provider decoded from its native payload. */
+    readonly resultDetails?: ToolResultDetails;
     readonly providerPayload?: ToolProviderPayload;
   };
 
@@ -187,12 +192,13 @@ export type ProviderSessionStateChangedEvent = ProviderEventBase<
     readonly snapshot: ProviderSessionSnapshot;
   };
 
-export type ProviderModeChangedEvent = ProviderEventBase<
-  'mode_changed',
+export type ProviderPermissionModeChangedEvent = ProviderEventBase<
+  'permission_mode_changed',
   ProviderExecutionEventScope
 > &
   ProviderOpaqueEventPayload & {
-    readonly mode: string;
+    /** A value from the provider's permission-mode policy. */
+    readonly permissionMode: string;
     readonly snapshot: ProviderSessionSnapshot;
   };
 
@@ -207,9 +213,11 @@ export type ProviderTurnCompletedEvent = ProviderEventBase<
   ProviderRequestedEventScope
 > &
   ProviderOpaqueEventPayload & {
+    /** Native identity of the final user message in this turn, including late correlation. */
+    readonly nativeUserMessageId?: string;
     readonly nativeAssistantId?: string;
     readonly nativeCheckpointId?: string;
-    readonly planCompleted?: boolean;
+    readonly turnStats?: TurnStats;
     readonly reason: ProviderTurnCompletionReason;
   };
 
@@ -253,9 +261,10 @@ export type ProviderRequestedExecutionEvent =
   | (ProviderToolCompletedEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderUsageUpdatedEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderContextCompactedEvent & { readonly scope: ProviderRequestedEventScope })
+  | (ProviderTaskNotificationEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderNoticeEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderSessionStateChangedEvent & { readonly scope: ProviderRequestedEventScope })
-  | (ProviderModeChangedEvent & { readonly scope: ProviderRequestedEventScope })
+  | (ProviderPermissionModeChangedEvent & { readonly scope: ProviderRequestedEventScope })
   | ProviderTurnCompletedEvent
   | ProviderCancelledEvent
   | ProviderExecutionErrorEvent;
@@ -295,6 +304,29 @@ export type ProviderAsyncSubagentCompletedEvent = ProviderEventBase<
     readonly snapshotRevision?: number;
   };
 
+export type ProviderSubagentUpdatedEvent = ProviderEventBase<
+  'subagent_updated', ProviderSessionEventScope
+> & { readonly subagent: SubagentInfo };
+
+export type ProviderSubagentProgressEvent = ProviderEventBase<
+  'subagent_progress',
+  ProviderSessionEventScope
+> &
+  ProviderOpaqueEventPayload & {
+    readonly progress: SubagentProgress;
+  };
+
+export type ProviderTaskNotificationEvent = ProviderEventBase<
+  'task_notification',
+  ProviderExecutionEventScope
+> & {
+  readonly content: string;
+  /** Latest requested event emitted before this independent notification. */
+  readonly afterRequestedEvent?: ProviderRequestedEventScope;
+  /** Latest automatic event emitted before this independent notification. */
+  readonly afterBackgroundEvent?: ProviderBackgroundEventScope;
+};
+
 export type ProviderSessionErrorEvent = ProviderEventBase<
   'session_error',
   ProviderSessionEventScope
@@ -316,17 +348,33 @@ export type ProviderBackgroundOutputEvent =
   | (ProviderToolCompletedEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderUsageUpdatedEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderContextCompactedEvent & { readonly scope: ProviderBackgroundEventScope })
+  | (ProviderTaskNotificationEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderNoticeEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderSessionStateChangedEvent & { readonly scope: ProviderBackgroundEventScope })
-  | (ProviderModeChangedEvent & { readonly scope: ProviderBackgroundEventScope });
+  | (ProviderPermissionModeChangedEvent & { readonly scope: ProviderBackgroundEventScope });
+
+export type ProviderCommandsChangedEvent = ProviderEventBase<
+  'commands_changed', ProviderSessionEventScope
+>;
 
 export type ProviderSessionEvent =
+  | (ProviderEventBase<'prompt_suggestion', ProviderSessionEventScope> & {
+      readonly originatingTurnId: string;
+      readonly suggestion: string;
+    })
+  | ProviderCommandsChangedEvent
+  | (ProviderTaskNotificationEvent & { readonly scope: ProviderSessionEventScope })
   | ProviderBackgroundTurnStartedEvent
   | ProviderBackgroundOutputEvent
   | ProviderBackgroundTurnCompletedEvent
   | ProviderAsyncSubagentCompletedEvent
+  | ProviderSubagentUpdatedEvent
+  | ProviderSubagentProgressEvent
   | (ProviderSessionStateChangedEvent & { readonly scope: ProviderSessionEventScope })
-  | (ProviderModeChangedEvent & { readonly scope: ProviderSessionEventScope })
+  | (ProviderPermissionModeChangedEvent & { readonly scope: ProviderSessionEventScope })
   | ProviderSessionErrorEvent;
 
 export type ProviderExecutionEvent = ProviderRequestedExecutionEvent;
+
+/** An event before its owner assigns the correlation envelope. */
+export type WithoutEventScope<T> = T extends unknown ? Omit<T, 'scope'> : never;

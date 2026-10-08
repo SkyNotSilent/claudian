@@ -1,68 +1,53 @@
-import type {
-  CollabComposerReferencePort,
-  CollabComposerReferenceSubscription,
-} from '@/core/collab';
 import type { ProviderCommandDropdownConfig } from '@/core/providers/commands/ProviderCommandCatalog';
 import type { ProviderCommandDiscoverySource } from '@/core/providers/commands/ProviderCommandDiscoveryStore';
 import type { ProviderCommandEntry } from '@/core/providers/commands/ProviderCommandEntry';
 import type { ProviderId } from '@/core/providers/types';
-import type { SlashCommand } from '@/core/types';
+import type { FileContextManager } from '@/features/chat/composer/FileContextManager';
 import {
   ComposerDropdownController,
   SlashCommandSource,
 } from '@/shared/composer-dropdown';
-
-import type { FileContextManager } from '../ui/FileContext';
-import { CollabMemberChangesFolder } from './CollabMemberChangesFolder';
-import { CollabTicketReferenceSource } from './CollabTicketReferenceSource';
+import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
 
 export interface MainChatComposerDropdownOptions {
   readonly hiddenCommands?: ReadonlySet<string>;
-  readonly collabReferences?: CollabComposerReferencePort;
-  readonly onSlashCommandSelected?: (command: SlashCommand) => void;
   readonly providerConfig?: ProviderCommandDropdownConfig;
   readonly providerDiscovery?: ProviderCommandDiscoverySource<ProviderCommandEntry>;
-  readonly providerId: ProviderId;
+  readonly providerId: ProviderId | null;
 }
 
 export class MainChatComposerDropdown {
   private readonly controller: ComposerDropdownController;
   private readonly slashSource: SlashCommandSource;
   private readonly mentionSource: ReturnType<FileContextManager['getMentionSource']>;
-  private readonly selectionSubscription: CollabComposerReferenceSubscription | null;
-  private readonly ticketSource: CollabTicketReferenceSource | null;
+  private readonly removeCommandPresentation: () => void;
 
   constructor(
     containerEl: HTMLElement,
-    inputEl: HTMLTextAreaElement,
+    inputEl: ComposerInputElement,
     fileContextManager: FileContextManager,
     options: MainChatComposerDropdownOptions,
   ) {
     this.slashSource = new SlashCommandSource({
       hiddenCommands: options.hiddenCommands,
-      onSelect: options.onSlashCommandSelected,
       providerConfig: options.providerConfig,
       providerDiscovery: options.providerDiscovery,
       providerId: options.providerId,
     });
     this.mentionSource = fileContextManager.getMentionSource();
-    const memberChanges = options.collabReferences
-      ? new CollabMemberChangesFolder(options.collabReferences)
-      : null;
-    if (memberChanges) {
-      this.mentionSource.setExtensionFoldersLoader(signal => memberChanges.getRootItems(signal));
-    }
-    this.selectionSubscription = options.collabReferences?.subscribeSelection(
-      () => this.mentionSource.invalidate(),
-    ) ?? null;
-    this.ticketSource = options.collabReferences
-      ? new CollabTicketReferenceSource(options.collabReferences)
-      : null;
     this.controller = new ComposerDropdownController(
       containerEl,
       inputEl,
-      [this.slashSource, this.mentionSource, ...(this.ticketSource ? [this.ticketSource] : [])],
+      [this.slashSource, this.mentionSource],
     );
+    const resolveCommand = (token: string, atInputStart: boolean) =>
+      this.slashSource.resolveCommandKind(token, atInputStart);
+    inputEl.setCommandResolver?.(resolveCommand);
+    const unsubscribe = this.slashSource.subscribeInvalidation(() => inputEl.setCommandResolver?.(resolveCommand));
+    this.removeCommandPresentation = () => {
+      unsubscribe();
+      inputEl.setCommandResolver?.(null);
+    };
   }
 
   clearProviderCatalog(): void {
@@ -74,10 +59,8 @@ export class MainChatComposerDropdown {
   }
 
   destroy(): void {
+    this.removeCommandPresentation();
     this.controller.destroy();
-    this.selectionSubscription?.dispose();
-    this.mentionSource.setExtensionFoldersLoader(undefined);
-    this.ticketSource?.destroy();
     this.slashSource.destroy();
   }
 
@@ -97,8 +80,8 @@ export class MainChatComposerDropdown {
     return this.controller.isVisible();
   }
 
-  setEnabled(enabled: boolean): void {
-    this.controller.setEnabled(enabled);
+  setBuiltInsEnabled(enabled: boolean): void {
+    this.slashSource.setBuiltInsEnabled(enabled);
   }
 
   setHiddenCommands(commands: ReadonlySet<string>): void {
@@ -112,7 +95,7 @@ export class MainChatComposerDropdown {
     this.slashSource.setProviderCatalog(config, discovery);
   }
 
-  setProviderId(providerId: ProviderId): void {
+  setProviderId(providerId: ProviderId | null): void {
     this.slashSource.setProviderId(providerId);
   }
 }

@@ -2,32 +2,26 @@ import type { ProviderCommandCatalog } from '../../../core/providers/commands/Pr
 import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import type {
-  ProviderCliResolver,
-  ProviderModelCatalogRefreshResult,
-  ProviderTransitionOwnerContext,
+  ProviderCLIResolver,
   ProviderWorkspaceRegistration,
   ProviderWorkspaceServices,
 } from '../../../core/providers/types';
-import type { VaultFileAdapter } from '../../../core/storage/VaultFileAdapter';
-import { CodexAgentMentionProvider } from '../agents/CodexAgentMentionProvider';
-import { CodexSkillCatalog } from '../commands/CodexSkillCatalog';
-import { CodexCliResolver } from '../runtime/CodexCliResolver';
+import { CodexCommandCatalog } from '../commands/CodexCommandCatalog';
+import { CodexThreadArchiveService } from '../history/CodexThreadArchiveService';
+import { CodexAppServerRuntime } from '../runtime/CodexAppServerRuntime';
+import { CodexCLIResolver } from '../runtime/CodexCLIResolver';
 import { CodexModelCatalogCoordinator } from '../runtime/CodexModelCatalogCoordinator';
 import { CodexModelDiscoveryService } from '../runtime/CodexModelDiscoveryService';
+import { createCodexModels } from '../runtime/CodexModels';
 import { getCodexProviderSettings } from '../settings';
 import { CodexSkillListingService } from '../skills/CodexSkillListingService';
-import { CodexSubagentStorage } from '../storage/CodexSubagentStorage';
-import { codexSettingsTabRenderer } from '../ui/CodexSettingsTab';
+import { createCodexSettingsTabRenderer } from '../ui/CodexSettingsTab';
 
 export interface CodexWorkspaceServices extends ProviderWorkspaceServices {
-  subagentStorage: CodexSubagentStorage;
   commandCatalog: ProviderCommandCatalog;
-  agentMentionProvider: CodexAgentMentionProvider;
-  cliResolver: ProviderCliResolver;
+  cliResolver: ProviderCLIResolver;
   modelCatalogCoordinator: CodexModelCatalogCoordinator;
-  refreshModelCatalog(
-    context?: ProviderTransitionOwnerContext,
-  ): Promise<ProviderModelCatalogRefreshResult>;
+  runtime: CodexAppServerRuntime;
   dispose(): Promise<void>;
 }
 
@@ -36,78 +30,78 @@ export interface CodexWorkspaceServicesOptions {
   readonly skillListingService?: CodexSkillListingService;
 }
 
-function createCodexCliResolver(): ProviderCliResolver {
-  return new CodexCliResolver();
-}
-
 export async function createCodexWorkspaceServices(
   plugin: ProviderHost,
-  vaultAdapter: VaultFileAdapter,
   options: CodexWorkspaceServicesOptions = {},
 ): Promise<CodexWorkspaceServices> {
-  const subagentStorage = new CodexSubagentStorage(vaultAdapter);
-  const agentMentionProvider = new CodexAgentMentionProvider(subagentStorage);
-
+  const runtime = new CodexAppServerRuntime(plugin);
   const skillListProvider = options.skillListingService
-    ?? new CodexSkillListingService(plugin);
+    ?? new CodexSkillListingService(runtime);
   const modelCatalogCoordinator = options.modelCatalogCoordinator
     ?? new CodexModelCatalogCoordinator(
       plugin,
-      new CodexModelDiscoveryService(plugin),
+      new CodexModelDiscoveryService(plugin, runtime),
     );
-  const commandCatalog = new CodexSkillCatalog(skillListProvider);
+  const commandCatalog = new CodexCommandCatalog(skillListProvider);
+  const modelCatalog = createCodexModels(plugin, modelCatalogCoordinator);
+  const sessionArchive = new CodexThreadArchiveService(runtime);
   const unregisterTransitionHook = plugin.executionLifecycleRegistry
     .registerTransitionHook('codex', {
+      preserveSessions: () => getCodexProviderSettings(plugin.settings).enabled,
       beforeTransition: async () => {
+        modelCatalog.beginTransition();
         modelCatalogCoordinator.beginEnvironmentTransition();
         skillListProvider.beginEnvironmentTransition();
+        sessionArchive.beginEnvironmentTransition();
         await Promise.all([
           modelCatalogCoordinator.quiesceForEnvironmentChange(),
           skillListProvider.quiesceForEnvironmentChange(),
+          sessionArchive.quiesceForEnvironmentChange(),
         ]);
+        runtime.beginEnvironmentTransition();
       },
-      afterTransition: () => {
-        modelCatalogCoordinator.endEnvironmentTransition();
-        skillListProvider.endEnvironmentTransition();
+      afterTransition: async () => {
+        try {
+          await runtime.endEnvironmentTransition();
+        } finally {
+          modelCatalog.endTransition();
+          modelCatalogCoordinator.endEnvironmentTransition();
+          skillListProvider.endEnvironmentTransition();
+          sessionArchive.endEnvironmentTransition();
+        }
       },
     });
   let disposePromise: Promise<void> | null = null;
 
-  if (getCodexProviderSettings(plugin.settings).enabled) {
-    plugin.app.workspace.onLayoutReady(() => {
-      void modelCatalogCoordinator.ensureFresh('layout-ready');
-    });
-  }
-
+  const cliResolver = new CodexCLIResolver();
   return {
-    subagentStorage,
     commandCatalog,
-    agentMentionProvider,
-    cliResolver: createCodexCliResolver(),
+    runtime,
+    startRuntime: () => runtime.start(),
+    onAgentSkillsChanged: () => commandCatalog.refresh(),
+    cliResolver,
     modelCatalogCoordinator,
-    settingsTabRenderer: codexSettingsTabRenderer,
-    refreshAgentMentions: async () => {
-      await agentMentionProvider.loadAgents();
-    },
-    refreshModelCatalog: async context => modelCatalogCoordinator.refreshModelCatalog(context),
-    prepareSettings: async () => agentMentionProvider.loadAgents(),
+    settingsTabRenderer: createCodexSettingsTabRenderer({ cliResolver, modelCatalog }),
+    modelCatalog,
+    sessionArchive,
     dispose() {
       if (disposePromise) return disposePromise;
       unregisterTransitionHook();
       disposePromise = Promise.all([
+        modelCatalog.dispose(),
         modelCatalogCoordinator.dispose(),
         skillListProvider.dispose(),
-      ]).then(() => undefined);
+        sessionArchive.dispose(),
+      ]).finally(() => runtime.dispose()).then(() => undefined);
       return disposePromise;
     },
   };
 }
 
 export const codexWorkspaceRegistration: ProviderWorkspaceRegistration<CodexWorkspaceServices> = {
-  initialize: async ({ plugin, vaultAdapter }) => createCodexWorkspaceServices(
-    plugin,
-    vaultAdapter,
-  ),
+  consumesAgentSkills: true,
+  providesSessionArchive: true,
+  initialize: async ({ plugin }) => createCodexWorkspaceServices(plugin),
 };
 
 export function maybeGetCodexWorkspaceServices(): CodexWorkspaceServices | null {

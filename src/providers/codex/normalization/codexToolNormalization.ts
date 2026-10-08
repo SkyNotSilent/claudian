@@ -1,3 +1,7 @@
+import { stringifyUnknown } from '@/utils/stringify';
+
+import { isCodexEncryptedMessage } from './codexSubagentNormalization';
+
 /**
  * Shared Codex tool normalization layer.
  *
@@ -16,6 +20,8 @@ const TOOL_NAME_MAP: Record<string, string> = {
   exec_command: 'Bash',
   update_plan: 'TodoWrite',
   request_user_input: 'AskUserQuestion',
+  request_user_input_async: 'AskUserQuestion',
+  web__run: 'WebSearch',
   view_image: 'Read',
   web_search: 'WebSearch',
   web_search_call: 'WebSearch',
@@ -33,6 +39,15 @@ const NATIVE_TOOLS = new Set([
   'resume_agent',
   'close_agent',
 ]);
+
+/** Codex context-management tools: model bookkeeping with opaque payloads, not user-visible work. */
+const INTERNAL_TOOL_NAMESPACES = new Set(['history', 'notes']);
+const INTERNAL_TOOL_NAMES = new Set(['new_context', 'get_context_remaining']);
+
+export function isCodexInternalToolCall(rawName: string | undefined, namespace?: unknown): boolean {
+  if (typeof namespace === 'string' && namespace) return INTERNAL_TOOL_NAMESPACES.has(namespace);
+  return INTERNAL_TOOL_NAMES.has(rawName ?? '');
+}
 
 export function normalizeCodexToolName(rawName: string | undefined): string {
   if (!rawName) return 'tool';
@@ -458,6 +473,12 @@ export function normalizeCodexToolInput(
   rawName: string | undefined,
   input: Record<string, unknown>,
 ): Record<string, unknown> {
+  if (rawName && ['spawn_agent', 'followup_task', 'send_message', 'send_input'].includes(rawName)
+    && isCodexEncryptedMessage(input.message)) {
+    const displayInput = { ...input };
+    delete displayInput.message;
+    return displayInput;
+  }
   switch (rawName) {
     case 'command_execution':
     case 'shell_command':
@@ -470,6 +491,15 @@ export function normalizeCodexToolInput(
 
     case 'request_user_input':
       return { questions: normalizeQuestions(input) };
+
+    case 'request_user_input_async':
+      return {
+        questions: normalizeQuestions(input).map((question, index) => ({ ...question, id: String(index), isOther: true })),
+        replyMode: 'user-message',
+      };
+
+    case 'web__run':
+      return normalizeWebRunInput(input);
 
     case 'view_image':
       return {
@@ -539,7 +569,7 @@ function normalizeQuestions(input: Record<string, unknown>): Array<Record<string
       : [];
 
     return {
-      question: stringifyCodexValue(item.question) || `Question ${index + 1}`,
+      question: firstNonEmptyString(item.question, item.title) || `Question ${index + 1}`,
       ...(item.id ? { id: stringifyCodexValue(item.id) } : {}),
       header: typeof item.header === 'string' && item.header.trim()
         ? String(item.header)
@@ -574,6 +604,64 @@ function stringifyCodexValue(value: unknown): string {
   }
 }
 
+function normalizeWebRunInput(input: Record<string, unknown>): Record<string, unknown> {
+  const actions: Record<string, unknown>[] = [];
+  const records = (key: string): Record<string, unknown>[] => Array.isArray(input[key])
+    ? input[key].filter((value): value is Record<string, unknown> => (
+      value !== null && typeof value === 'object' && !Array.isArray(value)
+    ))
+    : [];
+  const queries = [...records('search_query'), ...records('image_query')]
+    .map(query => firstNonEmptyString(query.q)).filter(Boolean);
+  if (queries.length > 0) {
+    actions.push({ actionType: 'search', query: queries[0], ...(queries.length > 1 ? { queries } : {}) });
+  }
+  for (const request of records('open')) {
+    const url = firstNonEmptyString(request.ref_id, request.url);
+    if (url) actions.push({ actionType: 'open_page', url });
+  }
+  for (const request of records('find')) {
+    const url = firstNonEmptyString(request.ref_id, request.url);
+    const pattern = firstNonEmptyString(request.pattern);
+    if (url && pattern) actions.push({ actionType: 'find_in_page', url, pattern });
+  }
+  for (const request of records('click')) {
+    const url = firstNonEmptyString(request.ref_id, request.url);
+    if (url) actions.push({ actionType: 'click', url, linkId: stringifyCodexValue(request.id) });
+  }
+  for (const [operation, requests] of Object.entries(input)) {
+    if (!['search_query', 'image_query', 'open', 'find', 'click'].includes(operation)
+      && Array.isArray(requests) && requests.length > 0) {
+      actions.push({ actionType: operation, requests });
+    }
+  }
+  return actions.length > 0
+    ? { ...actions[0], ...(actions.length > 1 ? { actions } : {}) }
+    : input;
+}
+
+/** Native web search fields shared by live app-server items and persisted rollout records. */
+export interface CodexWebSearchRequest {
+  query?: unknown;
+  queries?: unknown;
+  url?: unknown;
+  pattern?: unknown;
+  action?: unknown;
+}
+
+export function normalizeCodexWebSearchInput(request: CodexWebSearchRequest): Record<string, unknown> {
+  return normalizeWebSearchInput({
+    query: request.query,
+    queries: request.queries,
+    url: request.url,
+    pattern: request.pattern,
+    action: request.action,
+  });
+}
+
+/** Native search items carry sources separately; their visible result is only an acknowledgement. */
+export const CODEX_WEB_SEARCH_RESULT = 'Search complete';
+
 function normalizeWebSearchInput(input: Record<string, unknown>): Record<string, unknown> {
   const action = input.action && typeof input.action === 'object'
     ? input.action as Record<string, unknown>
@@ -583,7 +671,9 @@ function normalizeWebSearchInput(input: Record<string, unknown>): Record<string,
   const query = firstNonEmptyString(action.query, input.query, queries[0]);
   const url = firstNonEmptyString(action.url, input.url);
   const pattern = firstNonEmptyString(action.pattern, input.pattern);
-  const explicitType = firstNonEmptyString(action.type, input.actionType, input.action_type);
+  const nativeType = firstNonEmptyString(action.type, input.actionType, input.action_type);
+  // App-server actions use camelCase names for the shared operation types.
+  const explicitType = nativeType === 'openPage' ? 'open_page' : nativeType === 'findInPage' ? 'find_in_page' : nativeType;
 
   const actionType = explicitType
     || (url && pattern ? 'find_in_page' : url ? 'open_page' : (query || queries.length > 0) ? 'search' : '');
@@ -630,34 +720,47 @@ function normalizeStringArray(value: unknown): string[] {
   return [...uniqueValues];
 }
 
+/** Polling `write_stdin` calls send no characters; their output belongs to the polled command. */
+export function isCodexSilentWriteStdinCall(name: string | undefined, input: Record<string, unknown>): boolean {
+  return name === 'write_stdin' && (typeof input.chars !== 'string' || input.chars.length === 0);
+}
+
+/** Visible acknowledgement of an async question; the answer arrives as a later user message. */
+export const CODEX_ASYNC_QUESTION_RESULT = 'Question sent. Awaiting your reply.';
+
+/** Terminal native item statuses that did not complete the requested work. */
+export function isCodexFailedToolStatus(status: unknown): boolean {
+  return status === 'failed' || status === 'error' || status === 'cancelled';
+}
+
 // ---------------------------------------------------------------------------
 // MCP tool normalization
 // ---------------------------------------------------------------------------
 
-interface CodexMcpResultPart {
+interface CodexMCPResultPart {
   type?: string;
   text?: string;
 }
 
-interface CodexMcpResultPayload {
-  content?: CodexMcpResultPart[] | null;
+interface CodexMCPResultPayload {
+  content?: CodexMCPResultPart[] | null;
 }
 
-export interface NormalizedCodexMcpToolState {
+export interface NormalizedCodexMCPToolState {
   isTerminal: boolean;
   isError: boolean;
   status: 'running' | 'completed' | 'error';
   result?: string;
 }
 
-export function normalizeCodexMcpToolName(server: unknown, tool: unknown): string {
+export function normalizeCodexMCPToolName(server: unknown, tool: unknown): string {
   const serverName = typeof server === 'string' ? server : '';
   const toolName = typeof tool === 'string' ? tool : '';
   if (!serverName && !toolName) return 'tool';
   return `mcp__${serverName}__${toolName}`;
 }
 
-export function normalizeCodexMcpToolInput(rawArguments: unknown): Record<string, unknown> {
+export function normalizeCodexMCPToolInput(rawArguments: unknown): Record<string, unknown> {
   if (typeof rawArguments === 'string') {
     return parseCodexArguments(rawArguments);
   }
@@ -669,20 +772,17 @@ export function normalizeCodexMcpToolInput(rawArguments: unknown): Record<string
   return {};
 }
 
-export function normalizeCodexMcpToolState(
+export function normalizeCodexMCPToolState(
   rawStatus: unknown,
   resultPayload?: unknown,
   rawError?: unknown,
-): NormalizedCodexMcpToolState {
+): NormalizedCodexMCPToolState {
   const status = typeof rawStatus === 'string' ? rawStatus : '';
   const error = typeof rawError === 'string' ? rawError : '';
-  const resultText = extractCodexMcpResultText(resultPayload);
-  const isTerminalStatus = status === 'completed'
-    || status === 'failed'
-    || status === 'error'
-    || status === 'cancelled';
+  const resultText = extractCodexMCPResultText(resultPayload);
+  const isTerminalStatus = status === 'completed' || isCodexFailedToolStatus(status);
   const isTerminal = isTerminalStatus || Boolean(error) || Boolean(resultText);
-  const isError = Boolean(error) || status === 'failed' || status === 'error' || status === 'cancelled';
+  const isError = Boolean(error) || isCodexFailedToolStatus(status);
 
   let result = error || resultText;
   if (!result && isTerminalStatus) {
@@ -697,10 +797,10 @@ export function normalizeCodexMcpToolState(
   };
 }
 
-function extractCodexMcpResultText(resultPayload?: unknown): string {
+function extractCodexMCPResultText(resultPayload?: unknown): string {
   if (!resultPayload || typeof resultPayload !== 'object') return '';
 
-  const content = (resultPayload as CodexMcpResultPayload).content;
+  const content = (resultPayload as CodexMCPResultPayload).content;
   if (!Array.isArray(content)) return '';
 
   return content
@@ -712,6 +812,9 @@ function extractCodexMcpResultText(resultPayload?: unknown): string {
 // ---------------------------------------------------------------------------
 // Tool result normalization
 // ---------------------------------------------------------------------------
+
+/** Code-mode exec transport header preceding values emitted by its script. */
+const CODE_MODE_SCRIPT_HEADER = /^Script (?:completed|failed|running with cell ID [^\r\n]+)\r?\nWall time [^\r\n]+\r?\nOutput:\r?\n/;
 
 /**
  * Tools whose results should get terminal-style unwrapping.
@@ -727,6 +830,19 @@ export function normalizeCodexToolResult(
   rawResult: string,
 ): string {
   if (!rawResult) return rawResult;
+  if (normalizedName === 'AskUserQuestion') {
+    try {
+      const result = JSON.parse(rawResult) as Record<string, unknown> | null;
+      if (result?.accepted === true && Object.keys(result).length === 1) {
+        return CODEX_ASYNC_QUESTION_RESULT;
+      }
+    } catch { /* Keep non-JSON question results intact. */ }
+  }
+  if (normalizedName === 'exec') {
+    // Only remove the transport envelope; arbitrary script output may itself
+    // contain JSON objects or "Output:" labels that must remain intact.
+    return rawResult.replace(CODE_MODE_SCRIPT_HEADER, '');
+  }
   if (!TERMINAL_RESULT_TOOLS.has(normalizedName)) return rawResult;
   return unwrapTerminalResult(rawResult);
 }
@@ -746,12 +862,7 @@ export function stringifyCodexToolOutput(value: unknown): string {
     if (textParts.length > 0) return textParts.join('');
   }
 
-  try {
-    const result = JSON.stringify(value);
-    return typeof result === 'string' ? result : String(value);
-  } catch {
-    return String(value);
-  }
+  return stringifyUnknown(value);
 }
 
 export function extractCodexExecCellId(output: string): string | undefined {
@@ -775,7 +886,29 @@ export function appendCodexCommandOutput(previous: string | undefined, next: str
   return `${previous}\n${next}`;
 }
 
+/** Literal stdout from a unified exec JSON result, optionally behind a code-mode truncation notice. */
+function readUnifiedExecOutput(text: string): string | undefined {
+  const transport = text
+    .replace(/^Warning: truncated output \(original token count: \d+\)\r?\nTotal output lines: \d+\r?\n\r?\n/, '')
+    .trim();
+  if (!transport.startsWith('{')) return undefined;
+  try {
+    const parsed = JSON.parse(transport) as Record<string, unknown>;
+    return typeof parsed.output === 'string' && ('chunk_id' in parsed || 'wall_time_seconds' in parsed)
+      ? parsed.output
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function unwrapTerminalResult(raw: string): string {
+  const body = raw.replace(CODE_MODE_SCRIPT_HEADER, '');
+  const unifiedExecOutput = readUnifiedExecOutput(body);
+  if (unifiedExecOutput !== undefined) return unifiedExecOutput;
+  // Other values a script emits are literal output.
+  if (body !== raw) return body;
+
   let result = raw;
 
   // Unwrap JSON { output: "..." } wrapper
@@ -800,10 +933,74 @@ function unwrapTerminalResult(raw: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Request matching
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a native item performs the request of a decoded raw call. Native items
+ * carry no raw call ID, so callers attribute them only on a unique match.
+ */
+export function codexToolRequestsMatch(
+  name: string,
+  requested: Record<string, unknown>,
+  native: Record<string, unknown>,
+): boolean {
+  if (name !== 'WebSearch') return stableValueKey(requested) === stableValueKey(native);
+  if (Array.isArray(requested.actions) && requested.actions.length > 1) {
+    return requested.actions.some(action => (
+      action !== null && typeof action === 'object' && !Array.isArray(action)
+      && codexToolRequestsMatch(name, action as Record<string, unknown>, native)
+    ));
+  }
+  const requestedWeb = normalizeComparedWebInput(requested);
+  const nativeWeb = normalizeComparedWebInput(native);
+  // Native reference-based opens and clicks can expose only an `other` action.
+  if (nativeWeb.actionType === 'other' && (requestedWeb.actionType === 'open_page' || requestedWeb.actionType === 'click')) {
+    return true;
+  }
+  // Native find events can retain the pattern but omit the opaque page reference.
+  if (nativeWeb.actionType === 'find_in_page' && !nativeWeb.url) {
+    delete requestedWeb.url;
+  }
+  return stableValueKey(requestedWeb) === stableValueKey(nativeWeb);
+}
+
+function normalizeComparedWebInput(input: Record<string, unknown>): Record<string, unknown> {
+  const normalized: Record<string, unknown> = { ...input };
+  if (normalized.actionType === 'open_page' || normalized.actionType === 'find_in_page') {
+    delete normalized.query;
+    delete normalized.queries;
+  } else if (Array.isArray(normalized.queries) && normalized.queries.length > 0) {
+    // The query field can be a display summary (first query + " ...").
+    // Compare the actual query list when the native event supplies it.
+    normalized.query = normalized.queries[0];
+    if (normalized.queries.length === 1) {
+      delete normalized.queries;
+    }
+  }
+  return normalized;
+}
+
+export function stableValueKey(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableValueKey).join(',')}]`;
+  }
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${stableValueKey(record[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
+}
+
+// ---------------------------------------------------------------------------
 // Error detection
 // ---------------------------------------------------------------------------
 
 export function isCodexToolOutputError(output: string): boolean {
+  if (/^Script failed(?:\r?\n|$)/.test(output.trimStart())) return true;
   const exitCodeMatch = output.match(/(?:Exit code:|Process exited with code)\s*(\d+)/i);
   if (exitCodeMatch) {
     return Number(exitCodeMatch[1]) !== 0;

@@ -85,11 +85,6 @@ const CLASS_DISPLAY: Record<string, string> = {
   'claudian-mode-selector': 'flex',
   'claudian-permission-toggle': 'flex',
   'claudian-service-tier-toggle': 'flex',
-  'claudian-status-panel-bash': 'block',
-  'claudian-status-panel-bash-content': 'block',
-  'claudian-status-panel-bash-entry-content': 'block',
-  'claudian-status-panel-content': 'block',
-  'claudian-status-panel-todos': 'block',
   'claudian-tab-content': 'flex',
   'claudian-thinking-budget': 'flex',
   'claudian-thinking-effort': 'flex',
@@ -97,7 +92,6 @@ const CLASS_DISPLAY: Record<string, string> = {
 
 const DISPLAY_CLASSES = new Set([
   'claudian-hidden',
-  'claudian-visible-block',
   'claudian-visible-flex',
   ...Object.keys(CLASS_DISPLAY),
 ]);
@@ -118,7 +112,6 @@ export function createMockEl(tag = 'div'): any {
   const resolveDisplay = (): string | null => {
     if (classes.has('claudian-hidden')) return 'none';
     if (classes.has('claudian-visible-flex')) return 'flex';
-    if (classes.has('claudian-visible-block')) return 'block';
 
     for (const [cls, display] of Object.entries(CLASS_DISPLAY)) {
       if (classes.has(cls)) return display;
@@ -148,6 +141,8 @@ export function createMockEl(tag = 'div'): any {
   };
 
   const defaultView = {
+    // Attribute observation is exercised with real DOM fixtures, not MockElement.
+    MutationObserver: class { observe() {} disconnect() {} },
     addEventListener: () => {},
     removeEventListener: () => {},
     requestAnimationFrame: (callback: FrameRequestCallback): number => {

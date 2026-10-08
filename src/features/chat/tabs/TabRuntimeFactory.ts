@@ -2,49 +2,46 @@ import type { Component } from 'obsidian';
 
 import type { ProviderId } from '@/core/providers/types';
 import type { Conversation } from '@/core/types';
+import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import type { ForkContext } from '@/features/chat/conversation/forkSourceTypes';
 import type { TabAttention, TabReviewOutcome } from '@/features/chat/state/types';
-import type { FeatureHost } from '@/features/FeatureHost';
-
+import type { TabId, TabProviderCatalogContext } from '@/features/chat/tabs/ChatTab';
 import type {
   PublishedTabRuntimeRef,
   TabRuntimeCleanup,
   TabRuntimeConstructionContext,
   TabRuntimeControllerBundle,
   TabRuntimeShellBundle,
-} from './runtime/TabRuntimeConstruction';
-import { buildTabRuntimeControllers } from './runtime/TabRuntimeControllers';
-import { buildTabRuntimeInputBindings } from './runtime/TabRuntimeInputBindings';
-import { buildTabRuntimeServices } from './runtime/TabRuntimeServices';
-import { buildTabRuntimeShell } from './runtime/TabRuntimeShell';
-import { buildTabRuntimeUI } from './runtime/TabRuntimeUI';
-import type { ForkContext } from './TabForking';
-import { registerTabRuntimeResourceOwner } from './TabLifecycle';
+} from '@/features/chat/tabs/runtime/TabRuntimeConstruction';
+import { buildTabRuntimeControllers } from '@/features/chat/tabs/runtime/TabRuntimeControllers';
+import { buildTabRuntimeInputBindings } from '@/features/chat/tabs/runtime/TabRuntimeInputBindings';
+import { buildTabRuntimePorts } from '@/features/chat/tabs/runtime/TabRuntimePorts';
+import { buildTabRuntimeServices } from '@/features/chat/tabs/runtime/TabRuntimeServices';
+import { buildTabRuntimeShell } from '@/features/chat/tabs/runtime/TabRuntimeShell';
+import { buildTabRuntimeUI } from '@/features/chat/tabs/runtime/TabRuntimeUI';
 import {
-  applyProviderUIGating,
-  refreshTabProviderUI,
-} from './TabProviderState';
-import type {
-  AssembledTabRuntime,
-  ProviderCatalogInfo,
-  TabId,
-  TabInputBindings,
-  TabProviderCatalogContext,
-  TabRuntimeCleanupFailure,
-  TabRuntimeResourceOwner,
-  TabServices,
-  TabUIComponents,
-} from './types';
+  registerTabRuntimeResourceOwner,
+  type TabRuntimeCleanupFailure,
+  type TabRuntimeResourceOwner,
+} from '@/features/chat/tabs/TabLifecycle';
+import { applyProviderUIGating, refreshTabProviderUI } from '@/features/chat/tabs/tabProviderUI';
+import type { TabSessionState } from '@/features/chat/tabs/TabSession';
+import type { AssembledTabRuntime, ProviderCatalogInfo, TabInputBindings, TabServices, TabUIComponents } from '@/features/chat/tabs/types';
+import type { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 
 export interface TabRuntimeFactoryOptions {
-  plugin: FeatureHost;
+  plugin: ChatFeatureHost;
   containerEl: HTMLElement;
   component: Component;
+  mentionDataProvider: VaultMentionDataProvider;
   conversation?: Conversation;
   tabId?: TabId;
+  initialState?: Readonly<TabSessionState>;
   draftModel?: string | null;
+  providerId?: ProviderId | null;
   lifecycleState?: Extract<
     AssembledTabRuntime['lifecycleState'],
-    'provisional' | 'cold'
+    'provisional' | 'open'
   >;
   getProviderCatalogConfig: (
     tab: TabProviderCatalogContext,
@@ -103,12 +100,12 @@ class RuntimeResourceOwner implements TabRuntimeResourceOwner {
   dispose(): Promise<readonly TabRuntimeCleanupFailure[]> {
     if (!this.disposal) {
       this.sealed = true;
-      this.disposal = this.disposeEntries();
+      this.disposal = this.#disposeEntries();
     }
     return this.disposal;
   }
 
-  private async disposeEntries(): Promise<readonly TabRuntimeCleanupFailure[]> {
+  async #disposeEntries(): Promise<readonly TabRuntimeCleanupFailure[]> {
     const failures: TabRuntimeCleanupFailure[] = [];
     const entries = this.entries.splice(0).reverse();
     for (const entry of entries) {
@@ -159,17 +156,16 @@ function composeTabRuntime(
   controllerBundle: TabRuntimeControllerBundle,
   inputBindings: TabInputBindings,
   resourceOwner: TabRuntimeResourceOwner,
+  plugin: ChatFeatureHost,
 ): AssembledTabRuntime {
-  return {
+  const ports = buildTabRuntimePorts(shell.dom, ui, controllerBundle, plugin, () => runtime);
+  const runtime: AssembledTabRuntime = {
     session: shell.session,
     get id() {
       return shell.id;
     },
     get lifecycleState() {
       return shell.lifecycleState;
-    },
-    set lifecycleState(value) {
-      shell.lifecycleState = value;
     },
     get hydrationState() {
       return shell.hydrationState;
@@ -180,20 +176,11 @@ function composeTabRuntime(
     get draftModel() {
       return shell.draftModel;
     },
-    set draftModel(value) {
-      shell.draftModel = value;
-    },
     get providerId() {
       return shell.providerId;
     },
-    set providerId(value) {
-      shell.providerId = value;
-    },
     get conversationId() {
       return shell.conversationId;
-    },
-    set conversationId(value) {
-      shell.conversationId = value;
     },
     executionCoordinator: shell.executionCoordinator,
     providerCatalogResolver: shell.providerCatalogResolver,
@@ -210,7 +197,9 @@ function composeTabRuntime(
         return resourceOwner.isDisposed;
       },
     },
+    ...ports,
   };
+  return runtime;
 }
 
 function assembleTabRuntime(
@@ -241,11 +230,12 @@ function assembleTabRuntime(
     controllerBundle,
     inputBindings,
     options.resourceOwner,
+    options.plugin,
   );
   registerTabRuntimeResourceOwner(runtime, options.resourceOwner);
   runtimeRef.publish(runtime);
 
-  refreshTabProviderUI(runtime, options.plugin);
+  refreshTabProviderUI(runtime);
   applyProviderUIGating(runtime, options.plugin);
   return runtime;
 }

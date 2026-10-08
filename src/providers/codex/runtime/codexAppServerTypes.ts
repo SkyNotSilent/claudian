@@ -6,27 +6,27 @@
 // JSON-RPC base
 // ---------------------------------------------------------------------------
 
-export interface JsonRpcRequest {
+export interface JSONRPCRequest {
   jsonrpc: '2.0';
   id: number;
   method: string;
   params?: unknown;
 }
 
-export interface JsonRpcNotification {
+export interface JSONRPCNotification {
   jsonrpc: '2.0';
   method: string;
   params?: unknown;
 }
 
-export interface JsonRpcResponse {
+export interface JSONRPCResponse {
   jsonrpc: '2.0';
   id: number;
   result?: unknown;
-  error?: JsonRpcError;
+  error?: JSONRPCError;
 }
 
-export interface JsonRpcError {
+export interface JSONRPCError {
   code: number;
   message: string;
   data?: unknown;
@@ -65,14 +65,17 @@ export interface Thread {
   updatedAt: number;
   name: string | null;
   modelProvider: string;
-  source: string;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  source: string | { subAgent: string | { thread_spawn: { parent_thread_id: string } } };
+  parentThreadId?: string | null;
   agentNickname: string | null;
   agentRole: string | null;
   gitInfo: GitInfo | null;
 }
 
 export interface ThreadStatus {
-  type: 'idle' | 'active' | 'systemError';
+  type: 'idle' | 'active' | 'systemError' | 'notLoaded';
   activeFlags?: string[];
 }
 
@@ -84,6 +87,7 @@ export interface GitInfo {
 
 export interface Turn {
   id: string;
+  durationMs?: number | null;
   items: ThreadItem[];
   status: 'inProgress' | 'completed' | 'failed' | 'interrupted';
   error: TurnError | null;
@@ -108,8 +112,9 @@ export type ThreadItem =
   | FileChangeItem
   | ImageViewItem
   | WebSearchItem
+  | SubAgentActivityItem
   | CollabAgentToolCallItem
-  | McpToolCallItem
+  | MCPToolCallItem
   | DynamicToolCallItem
   | ContextCompactionItem;
 
@@ -120,6 +125,8 @@ export interface UserMessageItem {
 }
 
 export interface AgentMessageItem {
+  delivery?: 'async' | null;
+  questions?: Array<{ title: string; options: string[] | null }> | null;
   type: 'agentMessage';
   id: string;
   text: string;
@@ -212,7 +219,17 @@ export interface WebSearchItem {
     url?: string;
     pattern?: string;
   };
+  /** Opaque structured sources, e.g. `{ title, url, snippet }` text results. */
+  results?: unknown[] | null;
   status?: string;
+}
+
+export interface SubAgentActivityItem {
+  type: 'subAgentActivity';
+  id: string;
+  kind: 'started' | 'interacted' | 'interrupted' | 'completed';
+  agentThreadId: string;
+  agentPath: string;
 }
 
 export interface CollabAgentToolCallItem {
@@ -222,15 +239,22 @@ export interface CollabAgentToolCallItem {
   status?: string;
   arguments?: Record<string, unknown>;
   result?: unknown;
+  senderThreadId?: string;
+  receiverThreadIds?: string[];
+  prompt?: string | null;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  agentsStates?: Record<string, { status: string; message: string | null }>;
 }
 
-export interface McpToolCallItem {
+export interface MCPToolCallItem {
   type: 'mcpToolCall';
   id: string;
   server: string;
   tool: string;
   status?: string;
-  arguments?: Record<string, unknown>;
+  /** JSON value; some servers report the raw argument string. */
+  arguments?: unknown;
   result?: { content?: Array<{ type?: string; text?: string }> } | null;
   error?: string | null;
   durationMs?: number | null;
@@ -363,6 +387,26 @@ export interface ModelListResult {
 }
 
 // ---------------------------------------------------------------------------
+// config/read
+// ---------------------------------------------------------------------------
+
+export interface ConfigReadParams {
+  cwd?: string | null;
+  includeLayers?: boolean;
+}
+
+export interface ConfigReadResult {
+  config: {
+    sandbox_workspace_write?: {
+      writable_roots?: string[];
+      network_access?: boolean;
+      exclude_tmpdir_env_var?: boolean;
+      exclude_slash_tmp?: boolean;
+    } | null;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // thread/start
 // ---------------------------------------------------------------------------
 
@@ -370,10 +414,12 @@ export interface ThreadStartParams {
   model?: string;
   cwd?: string;
   approvalPolicy?: string;
+  approvalsReviewer?: string;
   sandbox?: string;
   serviceTier?: string | null;
   baseInstructions?: string;
   experimentalRawEvents?: boolean;
+  ephemeral?: boolean;
   persistExtendedHistory?: boolean;
   sandboxPolicy?: SandboxPolicy;
   dynamicTools?: LegacyDynamicToolSpec[];
@@ -437,16 +483,15 @@ export type SandboxPolicy =
   | { type: 'dangerFullAccess' }
   | {
     type: 'workspaceWrite';
-    writableRoots: string[];
-    readOnlyAccess: { type: string };
-    networkAccess: boolean;
-    excludeTmpdirEnvVar: boolean;
-    excludeSlashTmp: boolean;
+    writableRoots?: string[];
+    networkAccess?: boolean;
+    excludeTmpdirEnvVar?: boolean;
+    excludeSlashTmp?: boolean;
   }
   | {
     type: 'readOnly';
-    access: { type: string };
-    networkAccess: boolean;
+    access?: { type: string };
+    networkAccess?: boolean;
   }
   | {
     type: 'externalSandbox';
@@ -461,6 +506,7 @@ export interface ThreadResumeParams {
   threadId: string;
   model?: string;
   approvalPolicy?: string;
+  approvalsReviewer?: string;
   sandbox?: string;
   serviceTier?: string | null;
   baseInstructions?: string;
@@ -778,6 +824,22 @@ export interface PermissionsApprovalRequest {
 export interface PermissionsApprovalResponse {
   permissions: GrantedPermissionProfile;
   scope?: PermissionGrantScope;
+}
+
+// -- MCP elicitation (mcpServer/elicitation/request) -------------------------
+
+export interface MCPElicitationRequest {
+  threadId: string;
+  turnId: string | null;
+  serverName: string;
+  mode: 'form' | 'openai/form' | 'url';
+  message: string;
+  requestedSchema?: unknown;
+}
+
+export interface MCPElicitationResponse {
+  action: 'accept' | 'decline' | 'cancel';
+  content: Record<string, unknown> | null;
 }
 
 // -- Tool request user input (item/tool/requestUserInput) --------------------

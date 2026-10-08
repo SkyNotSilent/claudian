@@ -1,8 +1,6 @@
 import type {
   ApprovalDecision,
   AskUserAnswers,
-  ExitPlanModeDecision,
-  ExitPlanModePresentationOptions,
 } from '../types';
 
 export interface ProviderInteractionIdentity {
@@ -29,7 +27,6 @@ export interface ProviderApprovalInteractionRequest
   readonly decisionReason?: string;
   readonly blockedPath?: string;
   readonly decisionOptions?: readonly ProviderApprovalDecisionOption[];
-  readonly additionalPermissions?: unknown;
 }
 
 export interface ProviderApprovalInteractionResponse {
@@ -46,18 +43,6 @@ export interface ProviderQuestionInteractionRequest
 export interface ProviderQuestionInteractionResponse {
   readonly interactionId: string;
   readonly answers: AskUserAnswers | null;
-}
-
-export interface ProviderPlanInteractionRequest
-  extends ProviderInteractionIdentity {
-  readonly kind: 'plan-decision';
-  readonly input: Readonly<Record<string, unknown>>;
-  readonly presentation?: ExitPlanModePresentationOptions;
-}
-
-export interface ProviderPlanInteractionResponse {
-  readonly interactionId: string;
-  readonly decision: ExitPlanModeDecision | null;
 }
 
 export type ProviderInteractionDismissReason =
@@ -84,10 +69,6 @@ export interface ProviderInteractionPort {
     request: ProviderQuestionInteractionRequest,
     signal: AbortSignal,
   ): Promise<ProviderQuestionInteractionResponse>;
-  requestPlanDecision(
-    request: ProviderPlanInteractionRequest,
-    signal: AbortSignal,
-  ): Promise<ProviderPlanInteractionResponse>;
   dismissInteraction(
     interactionId: string,
     reason: ProviderInteractionDismissReason,

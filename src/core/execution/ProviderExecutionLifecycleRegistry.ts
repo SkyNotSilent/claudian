@@ -11,9 +11,7 @@ declare const providerExecutionTransitionScopeBrand: unique symbol;
 export type ProviderExecutionOwnerKind =
   | 'chat'
   | 'title'
-  | 'instruction'
-  | 'inline-edit'
-  | 'warmup';
+  | 'inline-edit';
 
 export type ProviderExecutionInvalidationReason =
   | {
@@ -58,15 +56,18 @@ type ProviderExecutionTransitionCallback = (
   context: ProviderExecutionTransitionContext,
 ) => void | Promise<void>;
 
-export type ProviderExecutionTransitionHook =
-  | {
+export type ProviderExecutionTransitionHook = {
+  /** Shared-runtime providers fence new work and drain their own native generations. */
+  preserveSessions?(session: ProviderExecutionSession): boolean;
+} & (
+  {
       beforeTransition: ProviderExecutionTransitionCallback;
       afterTransition?: ProviderExecutionTransitionCallback;
     }
   | {
       beforeTransition?: ProviderExecutionTransitionCallback;
       afterTransition: ProviderExecutionTransitionCallback;
-    };
+    });
 
 export class ProviderExecutionTransitionError extends Error {
   readonly retryable = true;
@@ -123,19 +124,22 @@ class ProviderExecutionSessionLeaseImpl
   >();
   private releasePromise: Promise<void> | null = null;
   private released = false;
+  private acceptedGeneration: number;
 
   constructor(
     readonly generation: number,
     readonly session: ProviderExecutionSession,
     readonly owner: ProviderExecutionOwnerKind,
     private readonly state: ProviderLifecycleState,
-  ) {}
+  ) { this.acceptedGeneration = generation; }
+
+  preserveAcrossTransition(): void { this.acceptedGeneration = this.state.generation; }
 
   isCurrent(): boolean {
     return (
       !this.released &&
       this.invalidationReason === null &&
-      this.state.generation === this.generation &&
+      this.state.generation === this.acceptedGeneration &&
       this.state.leases.has(this)
     );
   }
@@ -144,7 +148,7 @@ class ProviderExecutionSessionLeaseImpl
     listener: (reason: ProviderExecutionInvalidationReason) => void,
   ): () => void {
     if (this.invalidationReason) {
-      this.notifyListener(listener, this.invalidationReason);
+      this.#notifyListener(listener, this.invalidationReason);
       return () => undefined;
     }
 
@@ -181,11 +185,11 @@ class ProviderExecutionSessionLeaseImpl
     const listeners = [...this.invalidationListeners];
     this.invalidationListeners.clear();
     for (const listener of listeners) {
-      this.notifyListener(listener, reason);
+      this.#notifyListener(listener, reason);
     }
   }
 
-  private notifyListener(
+  #notifyListener(
     listener: (reason: ProviderExecutionInvalidationReason) => void,
     reason: ProviderExecutionInvalidationReason,
   ): void {
@@ -215,8 +219,8 @@ export class ProviderExecutionLifecycleRegistry {
     config: ProviderSessionConfig,
     owner: ProviderExecutionOwnerKind,
   ): ProviderExecutionSessionLease {
-    this.assertAvailable();
-    const state = this.getOrCreateState(backend.providerId);
+    this.#assertAvailable();
+    const state = this.#getOrCreateState(backend.providerId);
     if (state.transitionReservations > 0) {
       throw new ProviderExecutionTransitionError(backend.providerId);
     }
@@ -246,7 +250,7 @@ export class ProviderExecutionLifecycleRegistry {
     mutation: (scope: ProviderExecutionTransitionScope) => Promise<T>,
     parentScope?: ProviderExecutionTransitionScope,
   ): Promise<T> {
-    this.assertAvailable();
+    this.#assertAvailable();
     const orderedProviderIds = [...new Set(providerIds)].sort();
     if (parentScope && this.activeTransitionScopes.has(parentScope)) {
       const rejectedProviderId =
@@ -262,7 +266,7 @@ export class ProviderExecutionLifecycleRegistry {
     }) as ProviderExecutionTransitionScope;
     this.activeTransitionScopes.add(scope);
     try {
-      return await this.runTransitionWithLocks(
+      return await this.#runTransitionWithLocks(
         orderedProviderIds,
         scope,
         () => mutation(scope),
@@ -272,14 +276,14 @@ export class ProviderExecutionLifecycleRegistry {
     }
   }
 
-  private async runTransitionWithLocks<T>(
+  async #runTransitionWithLocks<T>(
     orderedProviderIds: ProviderId[],
     scope: ProviderExecutionTransitionScope,
     mutation: () => Promise<T>,
   ): Promise<T> {
     const states = orderedProviderIds.map((providerId) => ({
       providerId,
-      state: this.getOrCreateState(providerId),
+      state: this.#getOrCreateState(providerId),
     }));
     const releaseLocks: Array<() => void> = [];
     for (const { state } of states) {
@@ -291,7 +295,7 @@ export class ProviderExecutionLifecycleRegistry {
         releaseLocks.push(await state.lock.acquire());
       }
 
-      this.assertAvailable();
+      this.#assertAvailable();
 
       const contexts = states.map(({ providerId, state }) => {
         state.generation += 1;
@@ -306,6 +310,9 @@ export class ProviderExecutionLifecycleRegistry {
       let result: T | undefined;
       let hasResult = false;
       const transitionHooks = states.map(({ state }) => [...state.hooks]);
+      const isPreserved = (state: ProviderLifecycleState, lease: ProviderExecutionSessionLeaseImpl) => (
+        [...state.hooks].some(hook => hook.preserveSessions?.(lease.session))
+      );
 
       try {
         const leases = states.flatMap(({ providerId, state }) => {
@@ -314,9 +321,13 @@ export class ProviderExecutionLifecycleRegistry {
             providerId,
             generation: state.generation,
           };
-          return [...state.leases].map((lease) => {
+          return [...state.leases].flatMap((lease) => {
+            if (isPreserved(state, lease)) {
+              lease.preserveAcrossTransition();
+              return [];
+            }
             lease.invalidate(reason);
-            return lease;
+            return [lease];
           });
         });
         errors.push(...await settleFailures(leases.map((lease) => lease.release())));
@@ -341,6 +352,13 @@ export class ProviderExecutionLifecycleRegistry {
       } catch (error) {
         errors.push(error);
       } finally {
+        // A mutation can disable a provider that preserved its running sessions
+        // before the transition. Invalidate those leases before runtime teardown.
+        for (const { providerId, state } of states) {
+          const leases = [...state.leases].filter(lease => !isPreserved(state, lease));
+          for (const lease of leases) lease.invalidate({ kind: 'provider-transition', providerId, generation: state.generation });
+          errors.push(...await settleFailures(leases.map(lease => lease.release())));
+        }
         for (let index = states.length - 1; index >= 0; index -= 1) {
           const hooks = [...transitionHooks[index]].reverse();
           for (const hook of hooks) {
@@ -375,8 +393,8 @@ export class ProviderExecutionLifecycleRegistry {
     providerId: ProviderId,
     hook: ProviderExecutionTransitionHook,
   ): () => void {
-    this.assertAvailable();
-    const state = this.getOrCreateState(providerId);
+    this.#assertAvailable();
+    const state = this.#getOrCreateState(providerId);
     state.hooks.add(hook);
 
     let registered = true;
@@ -391,11 +409,11 @@ export class ProviderExecutionLifecycleRegistry {
     if (this.disposePromise) return this.disposePromise;
 
     this.disposed = true;
-    this.disposePromise = this.disposeAll();
+    this.disposePromise = this.#disposeAll();
     return this.disposePromise;
   }
 
-  private async disposeAll(): Promise<void> {
+  async #disposeAll(): Promise<void> {
     const states = [...this.states.entries()]
       .sort(([first], [second]) => first.localeCompare(second))
       .map(([providerId, state]) => ({ providerId, state }));
@@ -433,13 +451,13 @@ export class ProviderExecutionLifecycleRegistry {
     }
   }
 
-  private assertAvailable(): void {
+  #assertAvailable(): void {
     if (this.disposed) {
       throw new ProviderExecutionRegistryDisposedError();
     }
   }
 
-  private getOrCreateState(providerId: ProviderId): ProviderLifecycleState {
+  #getOrCreateState(providerId: ProviderId): ProviderLifecycleState {
     let state = this.states.get(providerId);
     if (!state) {
       state = {

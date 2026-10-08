@@ -1,11 +1,13 @@
-import type {
-  ProviderApprovalDecisionOption,
-  ProviderInteractionDismissReason,
-  ProviderInteractionPort,
-  ProviderToolPolicy,
-} from '../../../core/execution';
-import type { ApprovalDecision } from '../../../core/types';
-import { normalizeCodexToolName } from '../normalization/codexToolNormalization';
+import {
+  type PendingInteraction,
+  PendingInteractionLedger,
+  type ProviderApprovalDecisionOption,
+  type ProviderInteractionDismissReason,
+  type ProviderInteractionPort,
+  type ProviderToolPolicy,
+} from '@/core/execution';
+import type { ApprovalDecision } from '@/core/types';
+import { normalizeCodexToolName } from '@/providers/codex/normalization/codexToolNormalization';
 import type {
   CommandApprovalRequest,
   CommandExecutionApprovalDecision,
@@ -15,13 +17,15 @@ import type {
   FileChangeApprovalDecision,
   FileChangeApprovalRequest,
   FileChangeApprovalResponse,
+  MCPElicitationRequest,
+  MCPElicitationResponse,
   PermissionsApprovalRequest,
   PermissionsApprovalResponse,
   RequestId,
   UserInputRequest,
   UserInputResponse,
-} from '../runtime/codexAppServerTypes';
-import type { CodexDynamicToolRegistry } from '../runtime/CodexDynamicToolRegistry';
+} from '@/providers/codex/runtime/codexAppServerTypes';
+import type { CodexDynamicToolRegistry } from '@/providers/codex/runtime/CodexDynamicToolRegistry';
 
 interface ActiveInteractionTurn {
   readonly localTurnId: string;
@@ -30,10 +34,9 @@ interface ActiveInteractionTurn {
   readonly toolPolicy: ProviderToolPolicy;
 }
 
-interface PendingInteraction {
-  readonly interactionId: string;
+interface PendingServerRequest {
+  readonly interaction: PendingInteraction;
   readonly nativeKey: string;
-  readonly controller: AbortController;
 }
 
 type NativeTurnObserver = (threadId: string, turnId: string) => boolean;
@@ -42,14 +45,17 @@ export class CodexExecutionServerRequestRouter {
   private activeTurn: ActiveInteractionTurn | null = null;
   private dynamicToolRegistry: CodexDynamicToolRegistry | null = null;
   private interactionCounter = 0;
-  private readonly pendingByNativeKey = new Map<string, PendingInteraction>();
-  private readonly pendingByLocalId = new Map<string, PendingInteraction>();
+  private readonly interactions: PendingInteractionLedger;
+  /** Native requests are unique per thread; the ledger keys interactions locally. */
+  private readonly pendingByNativeKey = new Map<string, PendingServerRequest>();
 
   constructor(
     private readonly sessionInstanceId: string,
     private readonly interactionPort: ProviderInteractionPort,
     private readonly observeNativeTurn: NativeTurnObserver,
-  ) {}
+  ) {
+    this.interactions = new PendingInteractionLedger(interactionPort);
+  }
 
   setActiveTurn(turn: ActiveInteractionTurn | null): void {
     this.activeTurn = turn;
@@ -66,27 +72,29 @@ export class CodexExecutionServerRequestRouter {
   ): Promise<unknown> {
     switch (method) {
       case 'item/commandExecution/requestApproval':
-        return this.handleCommandApproval(
+        return this.#handleCommandApproval(
           requestId,
           params as CommandApprovalRequest,
         );
       case 'item/fileChange/requestApproval':
-        return this.handleFileChangeApproval(
+        return this.#handleFileChangeApproval(
           requestId,
           params as FileChangeApprovalRequest,
         );
       case 'item/permissions/requestApproval':
-        return this.handlePermissionsApproval(
+        return this.#handlePermissionsApproval(
           requestId,
           params as PermissionsApprovalRequest,
         );
       case 'item/tool/requestUserInput':
-        return this.handleUserInputRequest(
+        return this.#handleUserInputRequest(
           requestId,
           params as UserInputRequest,
         );
+      case 'mcpServer/elicitation/request':
+        return this.#handleMcpElicitation(requestId, params);
       case 'item/tool/call':
-        return this.handleDynamicToolCall(params as DynamicToolCallParams);
+        return this.#handleDynamicToolCall(params as DynamicToolCallParams);
       default:
         throw new Error(`Unsupported server request: ${method}`);
     }
@@ -99,36 +107,31 @@ export class CodexExecutionServerRequestRouter {
     const pending = this.pendingByNativeKey.get(nativeRequestKey(threadId, requestId));
     if (!pending) return false;
 
-    this.interactionPort.dismissInteraction(pending.interactionId, 'resolved');
-    pending.controller.abort();
-    this.removePending(pending);
-    return true;
+    this.pendingByNativeKey.delete(pending.nativeKey);
+    return this.interactions.abort(pending.interaction.interactionId, 'resolved');
   }
 
   abortAll(reason: ProviderInteractionDismissReason): void {
-    for (const pending of [...this.pendingByLocalId.values()]) {
-      this.interactionPort.dismissInteraction(pending.interactionId, reason);
-      pending.controller.abort();
-      this.removePending(pending);
-    }
+    this.pendingByNativeKey.clear();
+    this.interactions.dismissAll(reason);
     this.activeTurn = null;
   }
 
-  private async handleDynamicToolCall(
+  async #handleDynamicToolCall(
     params: DynamicToolCallParams,
   ): Promise<DynamicToolCallResponse> {
-    const turn = this.requireActiveTurn(params.threadId, params.turnId);
+    const turn = this.#requireActiveTurn(params.threadId, params.turnId);
     if (!this.dynamicToolRegistry || !isDynamicToolAllowed(turn.toolPolicy, params)) {
       throw new Error(`Unsupported dynamic tool: ${qualifiedToolName(params)}`);
     }
     return this.dynamicToolRegistry.execute(params);
   }
 
-  private async handleCommandApproval(
+  async #handleCommandApproval(
     requestId: RequestId,
     params: CommandApprovalRequest,
   ): Promise<CommandExecutionApprovalResponse> {
-    const turn = this.requireActiveTurn(params.threadId, params.turnId);
+    const turn = this.#requireActiveTurn(params.threadId, params.turnId);
     if (!shouldRouteApproval(turn.toolPolicy)) {
       return { decision: 'decline' };
     }
@@ -145,10 +148,10 @@ export class CodexExecutionServerRequestRouter {
       proposedExecpolicyAmendment: params.proposedExecpolicyAmendment ?? null,
       proposedNetworkPolicyAmendments: params.proposedNetworkPolicyAmendments ?? null,
     };
-    const pending = this.createPending(requestId, params.threadId);
+    const pending = this.#createPending(requestId, params.threadId);
     try {
       const response = await this.interactionPort.requestApproval({
-        interactionId: pending.interactionId,
+        interactionId: pending.interaction.interactionId,
         sessionInstanceId: this.sessionInstanceId,
         turnId: turn.localTurnId,
         kind: 'approval',
@@ -156,9 +159,6 @@ export class CodexExecutionServerRequestRouter {
         input,
         description: describeCommandApproval(params),
         ...(params.reason ? { decisionReason: params.reason } : {}),
-        ...(params.additionalPermissions
-          ? { additionalPermissions: params.additionalPermissions }
-          : {}),
         decisionOptions: buildCommandApprovalDecisionOptions(params),
         nativeContext: {
           requestId,
@@ -166,30 +166,30 @@ export class CodexExecutionServerRequestRouter {
           nativeTurnId: params.turnId,
           itemId: params.itemId,
         },
-      }, pending.controller.signal);
+      }, pending.interaction.signal);
       return {
-        decision: response.interactionId === pending.interactionId
+        decision: response.interactionId === pending.interaction.interactionId
           ? mapCommandApprovalDecision(response.decision)
           : 'decline',
       };
     } finally {
-      this.removePending(pending);
+      this.#removePending(pending);
     }
   }
 
-  private async handleFileChangeApproval(
+  async #handleFileChangeApproval(
     requestId: RequestId,
     params: FileChangeApprovalRequest,
   ): Promise<FileChangeApprovalResponse> {
-    const turn = this.requireActiveTurn(params.threadId, params.turnId);
+    const turn = this.#requireActiveTurn(params.threadId, params.turnId);
     if (!shouldRouteApproval(turn.toolPolicy)) {
       return { decision: 'decline' };
     }
 
-    const pending = this.createPending(requestId, params.threadId);
+    const pending = this.#createPending(requestId, params.threadId);
     try {
       const response = await this.interactionPort.requestApproval({
-        interactionId: pending.interactionId,
+        interactionId: pending.interaction.interactionId,
         sessionInstanceId: this.sessionInstanceId,
         turnId: turn.localTurnId,
         kind: 'approval',
@@ -205,30 +205,30 @@ export class CodexExecutionServerRequestRouter {
           nativeTurnId: params.turnId,
           itemId: params.itemId,
         },
-      }, pending.controller.signal);
+      }, pending.interaction.signal);
       return {
-        decision: response.interactionId === pending.interactionId
+        decision: response.interactionId === pending.interaction.interactionId
           ? mapFileChangeApprovalDecision(response.decision)
           : 'decline',
       };
     } finally {
-      this.removePending(pending);
+      this.#removePending(pending);
     }
   }
 
-  private async handlePermissionsApproval(
+  async #handlePermissionsApproval(
     requestId: RequestId,
     params: PermissionsApprovalRequest,
   ): Promise<PermissionsApprovalResponse> {
-    const turn = this.requireActiveTurn(params.threadId, params.turnId);
+    const turn = this.#requireActiveTurn(params.threadId, params.turnId);
     if (!shouldRouteApproval(turn.toolPolicy)) {
       return { permissions: {}, scope: 'turn' };
     }
 
-    const pending = this.createPending(requestId, params.threadId);
+    const pending = this.#createPending(requestId, params.threadId);
     try {
       const response = await this.interactionPort.requestApproval({
-        interactionId: pending.interactionId,
+        interactionId: pending.interaction.interactionId,
         sessionInstanceId: this.sessionInstanceId,
         turnId: turn.localTurnId,
         kind: 'approval',
@@ -244,8 +244,8 @@ export class CodexExecutionServerRequestRouter {
           nativeTurnId: params.turnId,
           itemId: params.itemId,
         },
-      }, pending.controller.signal);
-      if (response.interactionId !== pending.interactionId) {
+      }, pending.interaction.signal);
+      if (response.interactionId !== pending.interaction.interactionId) {
         return { permissions: {}, scope: 'turn' };
       }
       if (response.decision === 'allow') {
@@ -256,22 +256,22 @@ export class CodexExecutionServerRequestRouter {
       }
       return { permissions: {}, scope: 'turn' };
     } finally {
-      this.removePending(pending);
+      this.#removePending(pending);
     }
   }
 
-  private async handleUserInputRequest(
+  async #handleUserInputRequest(
     requestId: RequestId,
     params: UserInputRequest,
   ): Promise<UserInputResponse> {
-    const turn = this.requireActiveTurn(params.threadId, params.turnId);
+    const turn = this.#requireActiveTurn(params.threadId, params.turnId);
     if (!shouldRouteApproval(turn.toolPolicy)) {
       return { answers: {} };
     }
-    const pending = this.createPending(requestId, params.threadId);
+    const pending = this.#createPending(requestId, params.threadId);
     try {
       const response = await this.interactionPort.askUserQuestion({
-        interactionId: pending.interactionId,
+        interactionId: pending.interaction.interactionId,
         sessionInstanceId: this.sessionInstanceId,
         turnId: turn.localTurnId,
         kind: 'question',
@@ -282,9 +282,9 @@ export class CodexExecutionServerRequestRouter {
           nativeTurnId: params.turnId,
           itemId: params.itemId,
         },
-      }, pending.controller.signal);
+      }, pending.interaction.signal);
       if (
-        response.interactionId !== pending.interactionId
+        response.interactionId !== pending.interaction.interactionId
         || response.answers === null
       ) {
         return { answers: {} };
@@ -300,16 +300,85 @@ export class CodexExecutionServerRequestRouter {
       }
       return { answers };
     } finally {
-      this.removePending(pending);
+      this.#removePending(pending);
     }
   }
 
-  private requireActiveTurn(
+  async #handleMcpElicitation(
+    requestId: RequestId,
+    params: unknown,
+  ): Promise<MCPElicitationResponse> {
+    if (!isMCPElicitationRequest(params) || params.turnId === null) {
+      return { action: 'cancel', content: null };
+    }
+    if (
+      params.mode === 'url'
+      || !isEmptyConfirmationSchema(params.requestedSchema)
+    ) {
+      return { action: 'decline', content: null };
+    }
+
+    let pending: PendingServerRequest | undefined;
+    try {
+      const turn = this.#requireActiveTurn(params.threadId, params.turnId);
+      if (!shouldRouteApproval(turn.toolPolicy)) {
+        return { action: 'decline', content: null };
+      }
+      pending = this.#createPending(requestId, params.threadId);
+      const response = await this.interactionPort.askUserQuestion({
+        interactionId: pending.interaction.interactionId,
+        sessionInstanceId: this.sessionInstanceId,
+        turnId: turn.localTurnId,
+        kind: 'question',
+        input: {
+          questions: [{
+            id: MCP_CONFIRMATION_QUESTION_ID,
+            header: 'MCP request',
+            question: `MCP server: ${params.serverName}\n\n${params.message}`,
+            options: [
+              { label: 'Cancel', description: 'Cancel this request.', value: 'cancel' },
+              { label: 'Decline', description: 'Decline this request.', value: 'decline' },
+              { label: 'Allow', description: 'Accept this request.', value: 'accept' },
+            ],
+            multiSelect: false,
+            isOther: false,
+            isSecret: false,
+          }],
+        },
+        nativeContext: {
+          requestId,
+          threadId: params.threadId,
+          nativeTurnId: params.turnId,
+          serverName: params.serverName,
+        },
+      }, pending.interaction.signal);
+      if (
+        pending.interaction.signal.aborted
+        || this.activeTurn !== turn
+        || this.interactions.isStaleResponse(pending.interaction, response)
+        || !isPlainRecord(response.answers)
+        || Object.keys(response.answers).length !== 1
+      ) {
+        return { action: 'cancel', content: null };
+      }
+      const answer = response.answers[MCP_CONFIRMATION_QUESTION_ID];
+      if (answer === 'accept') return { action: 'accept', content: {} };
+      if (answer === 'decline') return { action: 'decline', content: null };
+      return { action: 'cancel', content: null };
+    } catch {
+      // Stale, aborted, and failed interactions must not grant MCP access.
+      return { action: 'cancel', content: null };
+    } finally {
+      if (pending) this.#removePending(pending);
+    }
+  }
+
+  #requireActiveTurn(
     threadId: string,
     nativeTurnId: string,
   ): ActiveInteractionTurn {
     if (!this.observeNativeTurn(threadId, nativeTurnId)) {
-      throw new Error('Stale Codex server request');
+      throw new Error('Stale Codex CLI server request');
     }
 
     const turn = this.activeTurn;
@@ -318,41 +387,65 @@ export class CodexExecutionServerRequestRouter {
       || turn.nativeThreadId !== threadId
       || turn.nativeTurnId !== nativeTurnId
     ) {
-      throw new Error('Stale Codex server request');
+      throw new Error('Stale Codex CLI server request');
     }
     return turn;
   }
 
-  private createPending(
+  #createPending(
     requestId: RequestId,
     threadId: string,
-  ): PendingInteraction {
-    const interactionId =
-      `${this.sessionInstanceId}:interaction:${++this.interactionCounter}`;
+  ): PendingServerRequest {
     const nativeKey = nativeRequestKey(threadId, requestId);
-    const existing = this.pendingByNativeKey.get(nativeKey);
-    if (existing) {
-      throw new Error('Duplicate Codex server request');
+    if (this.pendingByNativeKey.has(nativeKey)) {
+      throw new Error('Duplicate Codex CLI server request');
     }
 
-    const pending = {
-      interactionId,
-      nativeKey,
-      controller: new AbortController(),
-    };
+    const interactionId =
+      `${this.sessionInstanceId}:interaction:${++this.interactionCounter}`;
+    // Local interaction IDs are unique, so the ledger always admits them.
+    const pending = { interaction: this.interactions.begin(interactionId)!, nativeKey };
     this.pendingByNativeKey.set(nativeKey, pending);
-    this.pendingByLocalId.set(interactionId, pending);
     return pending;
   }
 
-  private removePending(pending: PendingInteraction): void {
+  /** Forgets a request whose interaction the port completed, without dismissing it. */
+  #removePending(pending: PendingServerRequest): void {
     if (this.pendingByNativeKey.get(pending.nativeKey) === pending) {
       this.pendingByNativeKey.delete(pending.nativeKey);
     }
-    if (this.pendingByLocalId.get(pending.interactionId) === pending) {
-      this.pendingByLocalId.delete(pending.interactionId);
-    }
+    this.interactions.release(pending.interaction);
   }
+}
+
+const MCP_CONFIRMATION_QUESTION_ID = 'mcp-elicitation-confirmation';
+const EMPTY_CONFIRMATION_SCHEMA_KEYS = new Set([
+  'type', 'properties', 'required', 'additionalProperties',
+]);
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isMCPElicitationRequest(value: unknown): value is MCPElicitationRequest {
+  return isPlainRecord(value)
+    && typeof value.threadId === 'string' && value.threadId.length > 0
+    && (value.turnId === null || (typeof value.turnId === 'string' && value.turnId.length > 0))
+    && typeof value.serverName === 'string' && value.serverName.trim().length > 0
+    && typeof value.message === 'string'
+    && (value.mode === 'form' || value.mode === 'openai/form' || value.mode === 'url');
+}
+
+function isEmptyConfirmationSchema(value: unknown): boolean {
+  return isPlainRecord(value)
+    && Object.keys(value).every(key => EMPTY_CONFIRMATION_SCHEMA_KEYS.has(key))
+    && value.type === 'object'
+    && isPlainRecord(value.properties)
+    && Object.keys(value.properties).length === 0
+    && (!('required' in value) || (Array.isArray(value.required) && value.required.length === 0))
+    && (!('additionalProperties' in value) || typeof value.additionalProperties === 'boolean');
 }
 
 function nativeRequestKey(threadId: string, requestId: RequestId): string {

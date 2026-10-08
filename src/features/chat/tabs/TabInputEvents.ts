@@ -1,7 +1,7 @@
 import { Platform } from 'obsidian';
 
-import type { ClaudianSettings } from '../../../core/types';
-import type { AssembledTabRuntime } from './types';
+import type { ClaudianSettings } from '@/core/types';
+import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 
 function isEnterWithoutShiftOrComposition(event: KeyboardEvent): boolean {
   return event.key === 'Enter' && !event.shiftKey && !event.isComposing;
@@ -34,8 +34,24 @@ function shouldSendMessageFromEnterKey(
   return true;
 }
 
+/**
+ * Cancels only the composer's currently selected destination. Returns true when
+ * a turn was actually cancelled.
+ */
+export function cancelSelectedDestinationTurn(tab: AssembledTabRuntime): boolean {
+  const sideChat = tab.controllers.sideChatController;
+  if (sideChat.destination === 'side') {
+    if (!sideChat.runtime?.isWorking) return false;
+    sideChat.cancelSide();
+    return true;
+  }
+  if (!tab.state.isStreaming && !tab.controllers.inputController.isPreparingMainTurn) return false;
+  tab.controllers.inputController.cancelStreaming();
+  return true;
+}
+
 function isTabInputFocused(tab: AssembledTabRuntime): boolean {
-  return tab.dom.inputEl.ownerDocument.activeElement === tab.dom.inputEl;
+  return tab.dom.inputEl.contains(tab.dom.inputEl.ownerDocument.activeElement);
 }
 
 function sendTabInputMessage(

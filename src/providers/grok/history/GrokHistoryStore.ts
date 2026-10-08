@@ -1,21 +1,25 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { resolveToolDiffData } from '@/core/tools/toolDiff';
+
 import { isWriteEditTool, TOOL_ASK_USER_QUESTION } from '../../../core/tools/toolNames';
+import { mergeToolResultDetails } from '../../../core/tools/toolResultDetails';
 import type {
   ChatMessage,
   ContentBlock,
   ImageAttachment,
   ImageMediaType,
   ToolCallInfo,
+  ToolResultDetails,
 } from '../../../core/types';
-import type { SDKToolUseResult } from '../../../core/types/diff';
-import { extractDiffData } from '../../../utils/diff';
-import { extractAcpDiffToolUseResult } from '../../acp/AcpToolResultNormalization';
+import { extractACPDiffResultDetails } from '../../acp/ACPToolResultNormalization';
 import {
+  buildGrokToolProviderPayload,
   type GrokRawToolNameResolution,
   normalizeGrokToolCall,
-  normalizeGrokToolUseResult,
+  normalizeGrokToolResultDetails,
+  normalizeGrokToolUpdate,
   resolveGrokRawToolName,
 } from '../normalization/grokToolNormalization';
 
@@ -54,11 +58,14 @@ interface StoredTool {
   rawNameProvenance: GrokRawToolNameResolution['provenance'];
   rawOutput: unknown;
   status: ToolCallInfo['status'];
-  toolUseResult?: SDKToolUseResult;
+  /** Result fields decoded from ACP `diff` content. */
+  acpResultDetails?: ToolResultDetails;
 }
 
 interface PendingTurn {
   assistantContent: string;
+  durationSeconds?: number;
+  completedAt?: number;
   assistantId?: string;
   blocks: ContentBlock[];
   images: ImageAttachment[];
@@ -75,6 +82,7 @@ interface PendingTurn {
 
 interface CompletedTurn {
   messages: ChatMessage[];
+  promptId?: string;
   promptIndex: number;
   usage?: GrokHistoryUsage;
 }
@@ -82,6 +90,7 @@ interface CompletedTurn {
 export function parseGrokHistoryContent(
   content: string,
   sessionId: string,
+  resumeAt?: string,
 ): ParsedGrokHistory {
   let completedTurns: CompletedTurn[] = [];
   let pending: PendingTurn | null = null;
@@ -98,6 +107,7 @@ export function parseGrokHistoryContent(
     if (messages.length === 0 || turn.timelinePromptIndex === null) return false;
     completedTurns.push({
       messages,
+      promptId,
       promptIndex: turn.timelinePromptIndex,
       ...(usage ? { usage } : {}),
     });
@@ -119,6 +129,25 @@ export function parseGrokHistoryContent(
     }
 
     const updateType = readString(update.sessionUpdate) ?? readString(update.type);
+    if (updateType === 'auto_compact_completed') {
+      if (pending) {
+        pending.blocks.push({ type: 'context_compacted' });
+      } else {
+        // Manual compaction has no native user turn. Keep it at the next prompt's
+        // rewind boundary without consuming that prompt index or creating a checkpoint.
+        const eventId = readString(readRecord(record.params._meta)?.eventId);
+        completedTurns.push({
+          messages: [{
+            id: eventId ?? `grok-${sanitizeId(sessionId)}-compact-${turnIndex}`,
+            role: 'assistant', content: '', timestamp: normalizeTimestamp(record.timestamp),
+            contentBlocks: [{ type: 'context_compacted' }],
+          }],
+          promptIndex: nextFallbackPromptIndex,
+        });
+        turnIndex += 1;
+      }
+      continue;
+    }
     if (updateType === 'rewind_marker') {
       const targetPromptIndex = readNonNegativeInteger(update.target_prompt_index)
         ?? readNonNegativeInteger(update.targetPromptIndex);
@@ -231,16 +260,35 @@ export function parseGrokHistoryContent(
     }
 
     if (updateType === 'tool_call' || updateType === 'tool_call_update') {
-      reconcileToolUpdate(pending, update);
+      reconcileToolUpdate(pending, normalizeGrokToolUpdate(update));
       continue;
     }
 
     if (updateType === 'turn_completed') {
+      const completedAt = normalizeTimestamp(record.timestamp);
+      const stopReason = readString(update.stop_reason) ?? readString(update.stopReason);
+      if (stopReason !== 'cancelled' && stopReason !== 'error'
+        && Number.isFinite(pending.startedAt) && pending.startedAt > 0
+        && Number.isFinite(completedAt) && completedAt >= pending.startedAt) {
+        pending.completedAt = completedAt;
+        pending.durationSeconds = Math.floor((completedAt - pending.startedAt) / 1_000);
+      }
       const promptId = readString(update.prompt_id) ?? readString(update.promptId);
       const usage = normalizeUsage(update.usage);
       commitPending(pending, promptId, usage);
       pending = null;
     }
+  }
+
+  if (resumeAt !== undefined) {
+    // Live checkpoints use prompt IDs, while stored messages retain their native IDs.
+    const checkpointIndex = completedTurns.findIndex(turn => (
+      turn.promptId === resumeAt
+      || turn.messages.some(message => (
+        message.role === 'assistant' && message.assistantMessageId === resumeAt
+      ))
+    ));
+    completedTurns = completedTurns.slice(0, checkpointIndex + 1);
   }
 
   const messages = completedTurns.flatMap(turn => turn.messages);
@@ -260,10 +308,11 @@ export function parseGrokHistoryContent(
 export async function loadGrokHistory(
   sessionDirectory: string,
   sessionId: string,
+  resumeAt?: string,
 ): Promise<ParsedGrokHistory> {
   try {
     const content = await fs.readFile(path.join(sessionDirectory, 'updates.jsonl'), 'utf8');
-    return parseGrokHistoryContent(content, sessionId);
+    return parseGrokHistoryContent(content, sessionId, resumeAt);
   } catch {
     return { messages: [] };
   }
@@ -322,24 +371,6 @@ export function resolveGrokPromptIndexAfterAssistant(
     }
   }
 
-  return resolveLegacyForkTargetPromptIndex(content, sessionId, resumeAt);
-}
-
-function resolveLegacyForkTargetPromptIndex(
-  content: string,
-  sessionId: string,
-  resumeAt: string,
-): number | null {
-  let completedPrompts = 0;
-  for (const message of parseGrokHistoryContent(content, sessionId).messages) {
-    if (message.role === 'user' && message.userMessageId) {
-      completedPrompts += 1;
-      continue;
-    }
-    if (message.assistantMessageId === resumeAt) {
-      return completedPrompts;
-    }
-  }
   return null;
 }
 
@@ -382,6 +413,13 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
     return;
   }
   const current = turn.tools.get(id);
+  // A backgrounded command completes its call, then reports task output on the same id.
+  if (
+    (current?.status === 'completed' || current?.status === 'error')
+    && normalizeToolStatus(readString(update.status), undefined) === 'running'
+  ) {
+    return;
+  }
   const rawNameResolution = resolveGrokRawToolName(current ? {
     provenance: current.rawNameProvenance,
     rawName: current.rawName,
@@ -402,9 +440,10 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
     title: rawName,
   }, rawNameResolution);
   const status = normalizeToolStatus(readString(update.status), current?.status);
-  const nativeToolUseResult = extractAcpDiffToolUseResult(update.content)
-    ?? current?.toolUseResult;
-  const output = renderedContent || (update.rawOutput === undefined
+  const acpResultDetails = extractACPDiffResultDetails(update.content)
+    ?? current?.acpResultDetails;
+  // Explicit text content is the presentation, even when empty (e.g. an image-only MCP result).
+  const output = hasTextContent(update.content) ? renderedContent : renderedContent || (update.rawOutput === undefined
     ? current?.output || normalized.output
     : normalized.output || current?.output) || '';
 
@@ -422,7 +461,7 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
     rawNameProvenance: rawNameResolution.provenance,
     rawOutput,
     status,
-    ...(nativeToolUseResult ? { toolUseResult: nativeToolUseResult } : {}),
+    ...(acpResultDetails ? { acpResultDetails } : {}),
   });
 }
 
@@ -456,29 +495,31 @@ function finalizeTurn(
     if (!tool) {
       return [];
     }
-    const providerToolUseResult = normalizeGrokToolUseResult(
-      tool.rawName,
-      tool.input,
-      tool.rawOutput,
-      tool.rawInput,
-    );
-    const toolUseResult: SDKToolUseResult = {
-      ...tool.toolUseResult,
-      ...providerToolUseResult,
-    };
+    const grokResultDetails = normalizeGrokToolResultDetails(tool.rawName, tool.input, tool.rawOutput);
+    const details = mergeToolResultDetails(tool.acpResultDetails, grokResultDetails);
     const toolCall: ToolCallInfo = {
       id: tool.id,
       input: tool.input,
       name: tool.name,
-      providerPayload: providerToolUseResult.providerPayload,
+      providerPayload: buildGrokToolProviderPayload({
+        rawInput: tool.rawInput,
+        rawName: tool.rawName,
+        rawOutput: tool.rawOutput,
+      }),
       ...(tool.output ? { result: tool.output } : {}),
       status: tool.status,
+      resultFormat: details?.resultFormat,
     };
-    if (toolCall.name === TOOL_ASK_USER_QUESTION && providerToolUseResult.answers) {
-      toolCall.resolvedAnswers = providerToolUseResult.answers;
+    if (details?.webSearchResults) {
+      toolCall.webSearchResults = details.webSearchResults;
+      if (details.webSearchSummary) toolCall.webSearchSummary = details.webSearchSummary;
+    }
+    if (details?.resultImages) toolCall.resultImages = details.resultImages;
+    if (toolCall.name === TOOL_ASK_USER_QUESTION && grokResultDetails?.resolvedAnswers) {
+      toolCall.resolvedAnswers = grokResultDetails.resolvedAnswers;
     }
     if (toolCall.status === 'completed' && isWriteEditTool(toolCall.name)) {
-      const diffData = extractDiffData(toolUseResult, toolCall);
+      const diffData = resolveToolDiffData(details?.diff, toolCall);
       if (diffData) toolCall.diffData = diffData;
     }
     return [toolCall];
@@ -486,6 +527,8 @@ function finalizeTurn(
   const assistant: ChatMessage = {
     assistantMessageId: assistantId,
     content: turn.assistantContent,
+    completedAt: turn.completedAt,
+    ...(turn.durationSeconds !== undefined ? { durationSeconds: turn.durationSeconds } : {}),
     ...(turn.blocks.length > 0 ? { contentBlocks: turn.blocks } : {}),
     id: assistantId,
     role: 'assistant',
@@ -571,6 +614,10 @@ function readImageMediaType(value: unknown): ImageMediaType | null {
   }
 }
 
+function hasTextContent(value: unknown): boolean {
+  return Array.isArray(value) && value.some(entry => readRecord(entry)?.type === 'content');
+}
+
 function renderToolContent(value: unknown): string {
   if (!Array.isArray(value)) {
     return '';
@@ -608,7 +655,34 @@ export function resolveGrokUpdateMessageId(
   return readString(update.messageId)
     ?? readString(updateMetadata?.eventId)
     ?? readString(outerMetadata?.eventId)
-    ?? readString(updateMetadata?.promptId)
+    ?? readTurnMessageId(role, updateMetadata, outerMetadata);
+}
+
+/**
+ * Live Grok chunks carry a fresh eventId per streamed token, so the turn's promptId
+ * must win over eventId when deciding where a live message starts.
+ */
+export function resolveGrokLiveMessageId(
+  value: unknown,
+  role: 'assistant' | 'user',
+  notificationMetadata?: unknown,
+): string | undefined {
+  const update = readRecord(value);
+  if (!update) return undefined;
+  const updateMetadata = readRecord(update._meta);
+  const outerMetadata = readRecord(notificationMetadata);
+  return readString(update.messageId)
+    ?? readTurnMessageId(role, updateMetadata, outerMetadata)
+    ?? readString(updateMetadata?.eventId)
+    ?? readString(outerMetadata?.eventId);
+}
+
+function readTurnMessageId(
+  role: 'assistant' | 'user',
+  updateMetadata: Record<string, unknown> | null,
+  outerMetadata: Record<string, unknown> | null,
+): string | undefined {
+  return readString(updateMetadata?.promptId)
     ?? readString(outerMetadata?.promptId)
     ?? (typeof updateMetadata?.promptIndex === 'number'
       ? `${role}-${updateMetadata.promptIndex}`

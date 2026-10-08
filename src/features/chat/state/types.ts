@@ -1,38 +1,40 @@
 import type { EditorView } from '@codemirror/view';
 
-import type { TodoItem } from '../../../core/tools/todo';
+import type { ProviderSelectionSnapshot, ProviderSessionReference } from '@/core/execution/ProviderExecutionRequest';
+import type { BrowserSelectionContext } from '@/core/prompt/browserContext';
+import type { CanvasSelectionContext } from '@/core/prompt/canvasContext';
+import type { EditorSelectionContext } from '@/core/prompt/editorContext';
 import type {
   ChatMessage,
   ImageAttachment,
   SubagentInfo,
   ToolCallInfo,
   UsageInfo,
-} from '../../../core/types';
-import type { BrowserSelectionContext } from '../../../utils/browser';
-import type { CanvasSelectionContext } from '../../../utils/canvas';
-import type { EditorSelectionContext } from '../../../utils/editor';
-import type { ThinkingBlockState } from '../rendering/ThinkingBlockRenderer';
-import type { WriteEditState } from '../rendering/WriteEditRenderer';
+} from '@/core/types';
+import type { ThinkingBlockState } from '@/features/chat/rendering/ThinkingBlockRenderer';
+import type { WriteEditState } from '@/features/chat/rendering/tools/WriteEditRenderer';
 
 export interface ChatTurnRequest {
+  selections?: readonly ProviderSelectionSnapshot[];
+  /** Original composer text for recovery before provider acceptance. */
+  draftContent?: string;
+  sessionReferences?: readonly ProviderSessionReference[];
   text: string;
   images?: ImageAttachment[];
   linkedContentPath?: string;
   editorSelection?: EditorSelectionContext | null;
   browserSelection?: BrowserSelectionContext | null;
   canvasSelection?: CanvasSelectionContext | null;
-  externalContextPaths?: string[];
 }
 
 /** Queued message waiting to be sent after current streaming completes. */
 export interface QueuedMessage {
+  /** Transient delivery observer; queues never persist callbacks. */
+  onDelivery?: (accepted: boolean) => void;
+  /** Display text; the turn request carries what is sent. */
   content: string;
-  images?: ImageAttachment[];
-  editorContext: EditorSelectionContext | null;
-  browserContext?: BrowserSelectionContext | null;
-  canvasContext: CanvasSelectionContext | null;
   /** Provider-neutral turn snapshot captured at enqueue time. */
-  turnRequest?: ChatTurnRequest;
+  turnRequest: ChatTurnRequest;
 }
 
 /** Pending tool call waiting to be rendered (buffered until input is complete). */
@@ -74,12 +76,8 @@ export interface ChatStateData {
   // Message state
   messages: ChatMessage[];
 
-  // Streaming control
-  isStreaming: boolean;
-  cancelRequested: boolean;
-  streamGeneration: number;
-  /** Guards against concurrent operations during conversation creation. */
-  isCreatingConversation: boolean;
+  /** Guards against concurrent operations while the tab resets to a new chat. */
+  isResettingToNewChat: boolean;
   /** Guards against concurrent operations during conversation switching. */
   isSwitchingConversation: boolean;
   /** Guards the destructive rewind transaction from overlapping tab actions. */
@@ -111,11 +109,6 @@ export interface ChatStateData {
 
   // Context window usage
   usage: UsageInfo | null;
-  // Flag to ignore usage updates (during session reset)
-  ignoreUsageUpdates: boolean;
-
-  // Current todo items for the persistent bottom panel
-  currentTodos: TodoItem[] | null;
 
   // Runtime-only attention state
   attention: TabAttention;
@@ -126,25 +119,26 @@ export interface ChatStateData {
   // Response timer state
   responseStartTime: number | null;
   flavorTimerInterval: number | null;
-
-  // Pending plan content for approve-new-session (auto-sends in new session after stream ends)
-  pendingNewSessionPlan: string | null;
-
-  // Plan file path captured from Write tool calls to provider plan directory during plan mode
-  planFilePath: string | null;
-
-  // Saved permission mode before entering plan mode (for Shift+Tab toggle restore)
-  prePlanPermissionMode: string | null;
 }
+
+/**
+ * Runtime-only latest live activity. Streamed text keeps the current block's
+ * immutable string, and tool activity references the live tool record, so
+ * recording stays O(1) per chunk; consumers project it only when displayed.
+ */
+export type ChatActivity =
+  | { kind: 'user'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'thinking' }
+  | { kind: 'tool'; tool: ToolCallInfo }
+  | { kind: 'error'; message: string };
 
 /** Callbacks for ChatState changes. */
 export interface ChatStateCallbacks {
-  onMessagesChanged?: () => void;
   onStreamingStateChanged?: (isStreaming: boolean) => void;
   onRewindingStateChanged?: (isRewinding: boolean) => void;
   onConversationChanged?: (id: string | null) => void;
   onUsageChanged?: (usage: UsageInfo | null) => void;
-  onTodosChanged?: (todos: TodoItem[] | null) => void;
   onAttentionChanged?: (attention: TabAttention) => void;
   onAutoScrollChanged?: (enabled: boolean) => void;
 }
@@ -156,7 +150,6 @@ export type {
   ImageAttachment,
   SubagentInfo,
   ThinkingBlockState,
-  TodoItem,
   ToolCallInfo,
   UsageInfo,
   WriteEditState,

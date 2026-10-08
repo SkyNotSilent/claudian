@@ -1,10 +1,9 @@
 import { getBuiltInCommandsForDropdown } from '@/core/commands/builtInCommands';
+import { normalizeArgumentHint } from '@/core/commands/slashCommand';
 import type { ProviderCommandDropdownConfig } from '@/core/providers/commands/ProviderCommandCatalog';
 import type { ProviderCommandDiscoverySource } from '@/core/providers/commands/ProviderCommandDiscoveryStore';
-import type { ProviderCommandEntry } from '@/core/providers/commands/ProviderCommandEntry';
+import type { ProviderCommandEntry, ProviderCommandKind } from '@/core/providers/commands/ProviderCommandEntry';
 import type { ProviderId } from '@/core/providers/types';
-import type { SlashCommand } from '@/core/types';
-import { normalizeArgumentHint } from '@/utils/slashCommand';
 
 import type {
   ComposerDropdownItem,
@@ -14,20 +13,18 @@ import type {
   ComposerTriggerMatch,
 } from './types';
 
-type SlashValue =
-  | {
-    readonly command: SlashCommand;
-    readonly kind: 'command';
-  }
-  | { readonly kind: 'retry' };
+type SlashValue = { readonly kind: 'command' | 'retry' };
+
+type SlashCommandDropdownItem = ComposerDropdownValueItem & {
+  readonly aliases?: readonly string[];
+};
 
 export interface SlashCommandSourceOptions {
   readonly hiddenCommands?: ReadonlySet<string>;
   readonly includeBuiltIns?: boolean;
-  readonly onSelect?: (command: SlashCommand) => void;
   readonly providerConfig?: ProviderCommandDropdownConfig;
   readonly providerDiscovery?: ProviderCommandDiscoverySource<ProviderCommandEntry>;
-  readonly providerId?: ProviderId;
+  readonly providerId?: ProviderId | null;
 }
 
 export class SlashCommandSource implements ComposerDropdownSource {
@@ -36,9 +33,8 @@ export class SlashCommandSource implements ComposerDropdownSource {
   private discovery: ProviderCommandDiscoverySource<ProviderCommandEntry> | null;
   private discoveryUnsubscribe: (() => void) | null = null;
   private hiddenCommands: ReadonlySet<string>;
-  private readonly includeBuiltIns: boolean;
+  private includeBuiltIns: boolean;
   private readonly listeners = new Set<() => void>();
-  private readonly onSelect: ((command: SlashCommand) => void) | undefined;
   private providerConfig: ProviderCommandDropdownConfig | null;
   private providerId: ProviderId | null;
 
@@ -46,10 +42,15 @@ export class SlashCommandSource implements ComposerDropdownSource {
     this.discovery = options.providerDiscovery ?? null;
     this.hiddenCommands = options.hiddenCommands ?? new Set();
     this.includeBuiltIns = options.includeBuiltIns ?? true;
-    this.onSelect = options.onSelect;
     this.providerConfig = options.providerConfig ?? null;
     this.providerId = options.providerId ?? options.providerConfig?.providerId ?? null;
-    this.bindDiscovery();
+    this.#bindDiscovery();
+  }
+
+  onOpen(): void {
+    if (this.providerConfig?.refreshOnOpen && this.discovery?.getSnapshot().status !== 'idle') {
+      this.#startDiscovery('retry');
+    }
   }
 
   clearProviderCatalog(): void {
@@ -74,7 +75,7 @@ export class SlashCommandSource implements ComposerDropdownSource {
     const snapshot = this.discovery?.getSnapshot();
     let result = snapshot;
     if (snapshot?.status === 'idle') {
-      this.startDiscovery('load');
+      this.#startDiscovery('load');
       result = { status: 'loading' };
     }
     const providerEntries = result?.status === 'ready'
@@ -83,11 +84,12 @@ export class SlashCommandSource implements ComposerDropdownSource {
     const includeBuiltIns = this.includeBuiltIns
       && match.atInputStart
       && match.trigger === '/';
-    const items = this.buildItems(providerEntries, includeBuiltIns)
+    const items = this.#buildItems(providerEntries, includeBuiltIns)
       .filter(item => {
         const query = match.query.toLocaleLowerCase();
         return item.label.toLocaleLowerCase().includes(query)
-          || item.detail?.toLocaleLowerCase().includes(query);
+          || item.detail?.toLocaleLowerCase().includes(query)
+          || item.aliases?.some(alias => alias.toLocaleLowerCase().includes(query));
       })
       .sort((left, right) => left.label.localeCompare(right.label));
 
@@ -150,14 +152,37 @@ export class SlashCommandSource implements ComposerDropdownSource {
     if (value.kind === 'retry') {
       return {
         kind: 'invoke',
-        onApplied: () => this.startDiscovery('retry'),
+        onApplied: () => this.#startDiscovery('retry'),
       };
     }
     return {
       kind: 'replace',
       text: item.replacement,
-      onApplied: () => this.onSelect?.(value.command),
     };
+  }
+
+  /** Resolves an inserted token such as `/review` with the same precedence the dropdown offers it. */
+  resolveCommandKind(token: string, atInputStart: boolean): ProviderCommandKind | null {
+    const key = token.toLocaleLowerCase();
+    if (this.includeBuiltIns && atInputStart && key.startsWith('/')) {
+      const name = key.slice(1);
+      if (getBuiltInCommandsForDropdown(this.providerId ?? undefined).some(command =>
+        [command.name, ...(command.aliases ?? [])].some(alias => alias.toLocaleLowerCase() === name))) {
+        return 'command';
+      }
+    }
+    const snapshot = this.discovery?.getSnapshot();
+    if (snapshot?.status !== 'ready') return null;
+    const entry = snapshot.items.find(item => !this.hiddenCommands.has(item.name.toLocaleLowerCase())
+      && `${item.insertPrefix}${item.name}`.toLocaleLowerCase() === key);
+    return entry?.kind ?? null;
+  }
+
+  /** Destinations without Claudian built-in commands hide them entirely. */
+  setBuiltInsEnabled(enabled: boolean): void {
+    if (this.includeBuiltIns === enabled) return;
+    this.includeBuiltIns = enabled;
+    this.notify();
   }
 
   setHiddenCommands(commands: ReadonlySet<string>): void {
@@ -173,11 +198,11 @@ export class SlashCommandSource implements ComposerDropdownSource {
     this.providerConfig = config;
     this.providerId = config.providerId;
     this.discovery = discovery;
-    this.bindDiscovery();
+    this.#bindDiscovery();
     this.notify();
   }
 
-  setProviderId(providerId: ProviderId): void {
+  setProviderId(providerId: ProviderId | null): void {
     this.providerId = providerId;
     this.notify();
   }
@@ -187,21 +212,21 @@ export class SlashCommandSource implements ComposerDropdownSource {
     return () => this.listeners.delete(listener);
   }
 
-  private bindDiscovery(): void {
+  #bindDiscovery(): void {
     this.discoveryUnsubscribe = this.discovery?.subscribe(() => this.notify()) ?? null;
   }
 
-  private startDiscovery(action: 'load' | 'retry'): void {
+  #startDiscovery(action: 'load' | 'retry'): void {
     const discovery = this.discovery;
     if (!discovery) return;
     void Promise.resolve().then(() => discovery[action]()).catch(() => undefined);
   }
 
-  private buildItems(
+  #buildItems(
     providerEntries: readonly ProviderCommandEntry[],
     includeBuiltIns: boolean,
-  ): ComposerDropdownValueItem[] {
-    const items: ComposerDropdownValueItem[] = [];
+  ): SlashCommandDropdownItem[] {
+    const items: SlashCommandDropdownItem[] = [];
     const seen = new Set<string>();
 
     if (includeBuiltIns) {
@@ -209,8 +234,8 @@ export class SlashCommandSource implements ComposerDropdownSource {
         const key = command.name.toLocaleLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
-        const slashCommand: SlashCommand = command;
         items.push({
+          aliases: command.aliases,
           detail: command.argumentHint
             ? `${command.description} · ${normalizeArgumentHint(command.argumentHint)}`
             : command.description,
@@ -218,7 +243,7 @@ export class SlashCommandSource implements ComposerDropdownSource {
           kind: 'value',
           label: `/${command.name}`,
           replacement: `/${command.name} `,
-          value: { command: slashCommand, kind: 'command' } satisfies SlashValue,
+          value: { kind: 'command' } satisfies SlashValue,
         });
       }
     }
@@ -227,22 +252,6 @@ export class SlashCommandSource implements ComposerDropdownSource {
       const key = entry.name.toLocaleLowerCase();
       if (seen.has(key) || this.hiddenCommands.has(key)) continue;
       seen.add(key);
-      const command: SlashCommand = {
-        agent: entry.agent,
-        allowedTools: entry.allowedTools,
-        argumentHint: entry.argumentHint,
-        content: entry.content,
-        context: entry.context,
-        description: entry.description,
-        disableModelInvocation: entry.disableModelInvocation,
-        hooks: entry.hooks,
-        id: entry.id,
-        kind: entry.kind,
-        model: entry.model,
-        name: entry.name,
-        source: entry.source,
-        userInvocable: entry.userInvocable,
-      };
       items.push({
         detail: entry.argumentHint
           ? `${entry.description ?? ''} · ${normalizeArgumentHint(entry.argumentHint)}`.trim()
@@ -251,7 +260,7 @@ export class SlashCommandSource implements ComposerDropdownSource {
         kind: 'value',
         label: `${entry.displayPrefix}${entry.name}`,
         replacement: `${entry.insertPrefix}${entry.name} `,
-        value: { command, kind: 'command' } satisfies SlashValue,
+        value: { kind: 'command' } satisfies SlashValue,
       });
     }
     return items;

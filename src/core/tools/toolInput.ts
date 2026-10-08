@@ -5,20 +5,11 @@
  */
 
 import type { AskUserAnswers } from '../types/tools';
-import {
-  TOOL_EDIT,
-  TOOL_GLOB,
-  TOOL_GREP,
-  TOOL_LS,
-  TOOL_NOTEBOOK_EDIT,
-  TOOL_READ,
-  TOOL_WRITE,
-} from './toolNames';
 
-export function extractResolvedAnswers(toolUseResult: unknown): AskUserAnswers | undefined {
-  if (typeof toolUseResult !== 'object' || toolUseResult === null) return undefined;
-  const r = toolUseResult as Record<string, unknown>;
-  return normalizeAnswersObject(r.answers);
+/** Reads the `answers` object of a structured question result. */
+export function extractResolvedAnswers(result: unknown): AskUserAnswers | undefined {
+  if (typeof result !== 'object' || result === null) return undefined;
+  return normalizeResolvedAnswers((result as Record<string, unknown>).answers);
 }
 
 function normalizeAnswerValue(value: unknown): string | string[] | undefined {
@@ -41,7 +32,8 @@ function normalizeAnswerValue(value: unknown): string | string[] | undefined {
   return undefined;
 }
 
-function normalizeAnswersObject(value: unknown): AskUserAnswers | undefined {
+/** Normalizes an answers object keyed by question text or id; empty answers are dropped. */
+export function normalizeResolvedAnswers(value: unknown): AskUserAnswers | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
 
   const answers: AskUserAnswers = {};
@@ -55,7 +47,7 @@ function normalizeAnswersObject(value: unknown): AskUserAnswers | undefined {
   return Object.keys(answers).length > 0 ? answers : undefined;
 }
 
-function parseAnswersFromJsonObject(resultText: string): AskUserAnswers | undefined {
+function parseAnswersFromJSONObject(resultText: string): AskUserAnswers | undefined {
   const start = resultText.indexOf('{');
   const end = resultText.lastIndexOf('}');
   if (start < 0 || end <= start) return undefined;
@@ -64,9 +56,9 @@ function parseAnswersFromJsonObject(resultText: string): AskUserAnswers | undefi
     const parsed = JSON.parse(resultText.slice(start, end + 1)) as unknown;
     if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
       const record = parsed as Record<string, unknown>;
-      return normalizeAnswersObject(record.answers) ?? normalizeAnswersObject(parsed);
+      return normalizeResolvedAnswers(record.answers) ?? normalizeResolvedAnswers(parsed);
     }
-    return normalizeAnswersObject(parsed);
+    return normalizeResolvedAnswers(parsed);
   } catch {
     return undefined;
   }
@@ -86,34 +78,13 @@ function parseAnswersFromQuotedPairs(resultText: string): AskUserAnswers | undef
 }
 
 /**
- * Fallback extractor for AskUserQuestion results when structured `toolUseResult.answers`
- * is unavailable (for example after reload from JSONL history).
+ * Fallback extractor for AskUserQuestion results when the provider reports no structured
+ * answers (for example after reload from JSONL history).
  */
 export function extractResolvedAnswersFromResultText(result: unknown): AskUserAnswers | undefined {
   if (typeof result !== 'string') return undefined;
   const trimmed = result.trim();
   if (!trimmed) return undefined;
 
-  return parseAnswersFromJsonObject(trimmed) ?? parseAnswersFromQuotedPairs(trimmed);
-}
-
-export function getPathFromToolInput(
-  toolName: string,
-  toolInput: Record<string, unknown>
-): string | null {
-  switch (toolName) {
-    case TOOL_READ:
-    case TOOL_WRITE:
-    case TOOL_EDIT:
-    case TOOL_NOTEBOOK_EDIT:
-      return (toolInput.file_path as string) || (toolInput.notebook_path as string) || null;
-    case TOOL_GLOB:
-      return (toolInput.path as string) || (toolInput.pattern as string) || null;
-    case TOOL_GREP:
-      return (toolInput.path as string) || null;
-    case TOOL_LS:
-      return (toolInput.path as string) || null;
-    default:
-      return null;
-  }
+  return parseAnswersFromJSONObject(trimmed) ?? parseAnswersFromQuotedPairs(trimmed);
 }

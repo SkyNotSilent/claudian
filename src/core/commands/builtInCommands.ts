@@ -10,15 +10,14 @@ import type { ProviderCapabilities, ProviderId } from '../providers/types';
 
 export type BuiltInCommandAction =
   | 'clear'
-  | 'add-dir'
   | 'resume'
   | 'fork'
   | 'fast'
-  | 'instruction';
+  | 'side';
 type BuiltInCommandCapability =
   | 'supportsNativeHistory'
   | 'supportsFork'
-  | 'supportsInstructionMode';
+  | 'supportsFastMode';
 type BuiltInCommandCapabilityContext =
   Partial<Pick<ProviderCapabilities, BuiltInCommandCapability>>
   & Partial<Pick<ProviderCapabilities, 'providerId'>>;
@@ -29,16 +28,10 @@ export interface BuiltInCommand {
   aliases?: string[];
   description: string;
   action: BuiltInCommandAction;
-  /** Whether this command accepts arguments. */
-  hasArgs?: boolean;
   /** Hint for arguments shown in dropdown (e.g., "path"). */
   argumentHint?: string;
   /** When set, provider capabilities must expose this feature. */
   requiredCapability?: BuiltInCommandCapability;
-  /** When set, only these providers expose and execute the command. */
-  supportedProviderIds?: ProviderId[];
-  /** When true, any submitted arguments leave the text for normal provider handling. */
-  exact?: boolean;
 }
 
 export interface BuiltInCommandResult {
@@ -53,13 +46,6 @@ export const BUILT_IN_COMMANDS: BuiltInCommand[] = [
     aliases: ['new'],
     description: 'Start a new conversation',
     action: 'clear',
-  },
-  {
-    name: 'add-dir',
-    description: 'Add external context directory',
-    action: 'add-dir',
-    hasArgs: true,
-    argumentHint: '[path/to/directory]',
   },
   {
     name: 'resume',
@@ -77,14 +63,15 @@ export const BUILT_IN_COMMANDS: BuiltInCommand[] = [
     name: 'fast',
     description: 'Toggle fast mode',
     action: 'fast',
-    supportedProviderIds: ['codex'],
+    requiredCapability: 'supportsFastMode',
   },
   {
-    name: 'instruction',
-    description: 'Save a reusable custom instruction',
-    action: 'instruction',
-    exact: true,
-    requiredCapability: 'supportsInstructionMode',
+    name: 'side',
+    aliases: ['btw'],
+    description: 'Ask a temporary side question from the latest reply',
+    action: 'side',
+    argumentHint: 'prompt',
+    requiredCapability: 'supportsFork',
   },
 ];
 
@@ -114,28 +101,12 @@ function resolveCapabilities(
   }
 }
 
-function isBuiltInCommandProviderSupported(
-  command: BuiltInCommand,
-  context?: BuiltInCommandSupportContext,
-): boolean {
-  if (!command.supportedProviderIds || !context) {
-    return true;
-  }
-
-  const providerId = typeof context === 'string' ? context : context.providerId;
-  return Boolean(providerId && command.supportedProviderIds.includes(providerId));
-}
-
 export function isBuiltInCommandSupported(
   command: BuiltInCommand,
   context?: BuiltInCommandSupportContext,
 ): boolean {
   if (!context) {
     return true;
-  }
-
-  if (!isBuiltInCommandProviderSupported(command, context)) {
-    return false;
   }
 
   if (!command.requiredCapability) {
@@ -155,22 +126,48 @@ export function detectBuiltInCommand(
   input: string,
   context?: BuiltInCommandSupportContext,
 ): BuiltInCommandResult | null {
-  const trimmed = input.trim();
-  if (!trimmed.startsWith('/')) return null;
-
-  // Extract command name (first word after /)
-  const match = trimmed.match(/^\/([a-zA-Z0-9_-]+)(?:\s(.*))?$/);
-  if (!match) return null;
-
-  const cmdName = match[1].toLowerCase();
-  const command = commandMap.get(cmdName);
-  if (!command) return null;
+  const parsed = parseLeadingBuiltInCommand(input);
+  if (!parsed || /[\r\n\u2028\u2029]/.test(parsed.rawArguments)) return null;
+  const { command } = parsed;
   if (!isBuiltInCommandSupported(command, context)) return null;
-
-  const args = (match[2] || '').trim();
-  if (command.exact && args.length > 0) return null;
+  const args = parsed.rawArguments.trim();
 
   return { command, args };
+}
+
+export interface SideChatCommandMatch {
+  /** Alias exactly as typed, lowercased. */
+  readonly alias: string;
+  /** Trimmed argument; empty when the alias was submitted on its own. */
+  readonly argument: string;
+}
+
+/**
+ * Recognizes a complete leading side-chat command token, including multiline
+ * arguments that the single-line built-in matcher deliberately rejects.
+ */
+export function detectSideChatCommand(input: string): SideChatCommandMatch | null {
+  const parsed = parseLeadingBuiltInCommand(input);
+  if (!parsed || parsed.command.action !== 'side') return null;
+  return { alias: parsed.alias, argument: parsed.rawArguments.trim() };
+}
+
+/**
+ * Leading built-in command token that Claudian owns for the main chat only,
+ * regardless of provider capability. Side-chat aliases are excluded because
+ * they are the side feature's own controls.
+ */
+export function detectMainOnlyBuiltInCommand(input: string): BuiltInCommand | null {
+  const parsed = parseLeadingBuiltInCommand(input);
+  return parsed && parsed.command.action !== 'side' ? parsed.command : null;
+}
+
+/** Whether the current provider exposes the side-chat command at all. */
+export function isSideChatCommandSupported(
+  context?: BuiltInCommandSupportContext,
+): boolean {
+  const command = commandMap.get('side');
+  return Boolean(command && isBuiltInCommandSupported(command, context));
 }
 
 /**
@@ -180,6 +177,7 @@ export function detectBuiltInCommand(
 export function getBuiltInCommandsForDropdown(context?: BuiltInCommandSupportContext): Array<{
   id: string;
   name: string;
+  aliases?: readonly string[];
   description: string;
   content: string;
   argumentHint?: string;
@@ -189,8 +187,22 @@ export function getBuiltInCommandsForDropdown(context?: BuiltInCommandSupportCon
     .map((cmd) => ({
       id: `builtin:${cmd.name}`,
       name: cmd.name,
+      aliases: cmd.aliases,
       description: cmd.description,
       content: '', // Built-in commands don't have prompt content
       argumentHint: cmd.argumentHint,
     }));
+}
+
+/** One token boundary for preview, reservation, and submitted command dispatch. */
+function parseLeadingBuiltInCommand(input: string): {
+  command: BuiltInCommand;
+  alias: string;
+  rawArguments: string;
+} | null {
+  const match = /^\/([a-zA-Z0-9_-]+)(?:\s([\s\S]*))?$/.exec(input.trim());
+  if (!match) return null;
+  const alias = match[1].toLowerCase();
+  const command = commandMap.get(alias);
+  return command ? { command, alias, rawArguments: match[2] ?? '' } : null;
 }

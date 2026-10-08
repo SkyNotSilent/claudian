@@ -123,28 +123,42 @@
   font-weight: var(--font-medium);
 }
 
-.claudian-save-env-btn {
-  padding: 6px 16px;
-  font-size: 13px;
-  background: var(--interactive-accent);
-  color: var(--text-on-accent);
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: opacity 0.2s;
-}
-
-.claudian-save-env-btn:hover {
-  opacity: 0.9;
-}
-
-.claudian-snippet-empty {
-  padding: 20px;
-  text-align: center;
+/* Empty state doubles as the save action; specificity beats the settings button reset. */
+.claudian-settings .claudian-env-snippets-container button.claudian-snippet-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--size-4-2);
+  width: 100%;
+  height: auto;
+  padding: var(--size-4-3);
+  border-radius: var(--radius-m);
+  background: transparent;
   color: var(--text-muted);
-  background: var(--background-secondary);
-  border-radius: 6px;
-  margin-top: 8px;
+  font-size: var(--font-ui-small);
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+/* The border must survive every interaction state, or the settings reset drops it and shifts layout. */
+.claudian-settings .claudian-env-snippets-container button.claudian-snippet-empty,
+.claudian-settings .claudian-env-snippets-container button.claudian-snippet-empty:is(:hover, :focus-visible, :active) {
+  border: 1px dashed var(--background-modifier-border);
+}
+
+.claudian-settings .claudian-env-snippets-container button.claudian-snippet-empty:is(:hover, :focus-visible) {
+  border-color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.claudian-snippet-empty-icon {
+  display: inline-flex;
+}
+
+.claudian-snippet-empty-icon svg {
+  width: 14px;
+  height: 14px;
 }
 
 .claudian-snippet-list {
@@ -191,48 +205,6 @@
   flex-shrink: 0;
 }
 
-.claudian-restore-snippet-btn {
-  padding: 4px 12px;
-  font-size: 12px;
-  background: var(--interactive-accent);
-  color: var(--text-on-accent);
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.claudian-restore-snippet-btn:hover {
-  opacity: 0.9;
-}
-
-.claudian-edit-snippet-btn {
-  padding: 4px 12px;
-  font-size: 12px;
-  background: var(--background-modifier-border);
-  color: var(--text-normal);
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.claudian-edit-snippet-btn:hover {
-  background: var(--background-modifier-border-hover);
-}
-
-.claudian-delete-snippet-btn {
-  padding: 4px 12px;
-  font-size: 12px;
-  background: var(--background-modifier-error);
-  color: var(--text-on-accent);
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.claudian-delete-snippet-btn:hover {
-  opacity: 0.9;
-}
-
 /* Env Snippet Modal */
 .claudian-env-snippet-modal .modal-content {
   max-width: 550px;
@@ -274,28 +246,6 @@
   font-family: var(--font-monospace);
   font-size: 12px;
   resize: vertical;
-}
-
-.claudian-snippet-preview {
-  margin: 8px 0;
-  padding: 6px;
-  background: var(--background-secondary);
-  border-radius: 6px;
-}
-
-.claudian-env-preview {
-  background: var(--background-primary);
-  padding: 6px;
-  border-radius: 4px;
-  font-family: var(--font-monospace);
-  font-size: 11px;
-  line-height: 1.3;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: var(--text-muted);
-  max-height: 120px;
-  overflow-y: auto;
-  margin: 0;
 }
 
 .claudian-snippet-buttons {

@@ -1,6 +1,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+import compactCompleted from '@test/fixtures/providers/grok/runtime/compaction-completed.json';
+import { testDate } from '@test/helpers/testClock';
+
 import {
   parseGrokHistoryContent,
   resolveGrokPromptIndexAfterAssistant,
@@ -25,6 +28,8 @@ describe('GrokHistoryStore', () => {
     expect(parsed.messages[1]).toMatchObject({
       content: 'Done.',
       role: 'assistant',
+      durationSeconds: 5,
+      completedAt: 1_700_000_005_000,
       toolCalls: [{
         id: 'tool-1',
         input: { path: 'notes/sample.md' },
@@ -42,12 +47,33 @@ describe('GrokHistoryStore', () => {
     ]);
     expect(parsed.messages[2]).toMatchObject({ content: 'Stop now.', role: 'user' });
     expect(parsed.messages[3]).toMatchObject({ content: 'Stopping.', role: 'assistant' });
+    expect(parsed.messages[3].durationSeconds).toBeUndefined();
     expect(parsed.messages.some(message => message.content.includes('Incomplete'))).toBe(false);
     expect(parsed.lastUsage).toEqual(expect.objectContaining({
       inputTokens: 10,
       outputTokens: 4,
       totalTokens: 16,
     }));
+  });
+
+  it.each([
+    [1_700_000_000, 1_700_000_065.9, 65],
+    [1_700_000_000_000, 1_700_000_065_900, 65],
+    [1_700_000_000_000, 1_700_000_000_900, 0],
+    [undefined, 1_700_000_065_000, undefined],
+    [1_700_000_000_000, undefined, undefined],
+    ['invalid', 1_700_000_065_000, undefined],
+    [1_700_000_000_000, 1_699_999_999_000, undefined],
+  ])('restores duration only from valid start and completion times (%s, %s)', (start, end, expected) => {
+    const content = [
+      { timestamp: start, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Inspect' } } },
+      { timestamp: start, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done' } } },
+      { timestamp: end, update: { sessionUpdate: 'turn_completed', stop_reason: 'end_turn' } },
+    ].map(({ timestamp, update }) => JSON.stringify({
+      timestamp, method: 'session/update', params: { sessionId: 'timing', update },
+    })).join('\n');
+
+    expect(parseGrokHistoryContent(content, 'timing').messages[1].durationSeconds).toBe(expected);
   });
 
   it('rehydrates only the active branch after a native rewind marker', () => {
@@ -105,6 +131,8 @@ describe('GrokHistoryStore', () => {
       'Replacement answer',
     ]);
     expect(parsed.messages.map(message => message.id)).not.toContain('assistant-abandoned');
+    expect(parsed.messages.filter(message => message.role === 'assistant').map(message => message.durationSeconds))
+      .toEqual([2, 2]);
     expect(parsed.lastUsage).toEqual({ totalTokens: 15 });
   });
 
@@ -834,4 +862,58 @@ describe('GrokHistoryStore', () => {
       expect.objectContaining({ content: 'Second answer', id: 'assistant-second', role: 'assistant' }),
     ]);
   });
+});
+
+it('does not infer a fork checkpoint from synthetic legacy message ids', () => {
+  const content = [
+    { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Question' } },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Answer' } },
+    { sessionUpdate: 'turn_completed', stop_reason: 'end_turn' },
+  ].map(update => JSON.stringify({ method: 'session/update', params: { sessionId: 'old', update } })).join('\n');
+  const assistant = parseGrokHistoryContent(content, 'old').messages.find(message => message.role === 'assistant');
+  expect(assistant?.assistantMessageId).toBeDefined();
+  expect(resolveGrokPromptIndexAfterAssistant(content, 'old', assistant!.assistantMessageId!)).toBeNull();
+});
+
+
+describe('Grok compaction boundaries', () => {
+  const time = testDate().getTime();
+  const complete = compactCompleted.params.update;
+  const user = { sessionUpdate: 'user_message_chunk', messageId: 'u1', content: { type: 'text', text: 'Question' } };
+  const answer = { sessionUpdate: 'agent_message_chunk', messageId: 'a1', content: { type: 'text', text: 'Answer' } };
+  const end = { sessionUpdate: 'turn_completed', prompt_id: 'p1', stop_reason: 'end_turn' };
+  const history = (updates: Record<string, unknown>[]) => updates.map((update, index) => JSON.stringify({
+    method: 'x.ai/session/update', timestamp: time + index, params: { sessionId: 'session-existing', update },
+  })).join('\n');
+
+  it('restores a standalone manual compact without inventing a user turn or rewind checkpoint', () => {
+    const messages = parseGrokHistoryContent(history([user, answer, end, complete]), 'session-existing').messages;
+    expect(messages).toHaveLength(3);
+    expect(messages[2]).toMatchObject({ role: 'assistant', content: '', contentBlocks: [{ type: 'context_compacted' }], timestamp: time + 3 });
+    expect(messages[2].assistantMessageId).toBeUndefined();
+    expect(parseGrokHistoryContent(history([user, answer, end, complete]), 'session-existing', 'p1').messages).toHaveLength(2);
+  });
+
+  it('retains an automatic boundary between text blocks inside its turn', () => {
+    const messages = parseGrokHistoryContent(history([user, answer, complete, answer, end]), 'session-existing').messages;
+    expect(messages[1].contentBlocks).toEqual([
+      { type: 'text', content: 'Answer' }, { type: 'context_compacted' }, { type: 'text', content: 'Answer' },
+    ]);
+  });
+
+  it('drops a standalone boundary when rewinding before it without shifting prompt indexes', () => {
+    const content = history([user, answer, end, complete,
+      { sessionUpdate: 'rewind_marker', target_prompt_index: 1 },
+      { ...user, messageId: 'u2' }, { ...answer, messageId: 'a2' }, { ...end, prompt_id: 'p2' },
+    ]);
+    expect(parseGrokHistoryContent(content, 'session-existing').messages.map(message => message.id)).toEqual(['u1', 'a1', 'u2', 'a2']);
+    expect(resolveGrokPromptIndexAfterAssistant(content, 'session-existing', 'a2')).toBe(2);
+  });
+
+  it.each(['auto_compact_started', 'auto_compact_failed', 'auto_compact_cancelled'])(
+    'does not restore a success divider from %s', sessionUpdate => {
+      const messages = parseGrokHistoryContent(history([user, { sessionUpdate }, answer, end]), 'session-existing').messages;
+      expect(messages.flatMap(message => message.contentBlocks ?? []).some(block => block.type === 'context_compacted')).toBe(false);
+    },
+  );
 });

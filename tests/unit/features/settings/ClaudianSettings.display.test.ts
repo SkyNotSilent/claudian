@@ -1,3 +1,8 @@
+/** @jest-environment jsdom */
+
+import { fireEvent, waitFor, within } from '@testing-library/dom';
+import { axe } from 'jest-axe';
+
 const mockRenderedSettingNames: string[] = [];
 const mockSettingDescriptionEls = new Map<string, MockContainer>();
 const mockToggleChanges = new Map<string, (value: boolean) => Promise<void>>();
@@ -10,7 +15,7 @@ const mockGitStatusElements: Array<{
 }> = [];
 
 type MockChainableComponent = Record<string, jest.Mock> & {
-  selectEl?: { replaceChildren: jest.Mock };
+  selectEl?: HTMLSelectElement;
 };
 
 jest.mock('obsidian', () => {
@@ -39,13 +44,34 @@ jest.mock('obsidian', () => {
       return this;
     }
 
+    setClass(_className: string): this {
+      return this;
+    }
+
     setHeading(): this {
       return this;
     }
 
     addDropdown(callback: (dropdown: MockChainableComponent) => void): this {
       const dropdown = createChainableComponent();
-      dropdown.selectEl = { replaceChildren: jest.fn() };
+      const label = document.createElement('label');
+      label.textContent = this.name;
+      const select = document.createElement('select');
+      label.append(select);
+      document.body.append(label);
+      dropdown.selectEl = select;
+      dropdown.addOption.mockImplementation((value: string, text: string) => {
+        select.add(new Option(text, value));
+        return dropdown;
+      });
+      dropdown.setValue.mockImplementation((value: string) => {
+        select.value = value;
+        return dropdown;
+      });
+      dropdown.onChange.mockImplementation((handler: (value: string) => Promise<void>) => {
+        select.addEventListener('change', () => { void handler(select.value); });
+        return dropdown;
+      });
       callback(dropdown);
       return this;
     }
@@ -132,7 +158,17 @@ jest.mock('obsidian', () => {
   };
 });
 
-import { DEFAULT_CLAUDIAN_SETTINGS } from '@/app/settings/defaultSettings';
+const mockSkillsSettingsTab = jest.fn();
+jest.mock('@/features/agent-skills/SkillsSettingsTab', () => ({
+  SkillsSettingsTab: class MockSkillsSettingsTab {
+    constructor(...args: unknown[]) { mockSkillsSettingsTab(...args); }
+    flush(): void {}
+    dispose(): void {}
+  },
+}));
+
+import { DEFAULT_CLAUDIAN_SETTINGS } from '@test/helpers/defaultSettings';
+
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import { ClaudianSettingTab } from '@/features/settings/ClaudianSettings';
@@ -150,23 +186,8 @@ function createTab(enableDualPane: boolean): {
     }),
     getAllViews: jest.fn(() => [{ refreshDualPaneLayout: jest.fn() }]),
     notifyAgentSkillsChanged: jest.fn(),
-    checkCollabGitInstallation: jest.fn().mockResolvedValue('available'),
-    setCollabEnabled: jest.fn(async (enabled: boolean) => {
-      settings.collabEnabled = enabled;
-    }),
-    setCollabProjectsFolder: jest.fn(async (raw: string) => {
-      if (raw === '../outside') {
-        return { message: 'Projects folder must stay inside the Vault.', ok: false as const };
-      }
-      const value = raw.trim();
-      settings.collabProjectsFolder = value;
-      return { ok: true as const, value };
-    }),
     storage: {
       getAdapter: jest.fn(() => ({})),
-    },
-    warmExecutionPool: {
-      reconcileLimit: jest.fn(),
     },
     providerHost: {
       settings,
@@ -176,7 +197,7 @@ function createTab(enableDualPane: boolean): {
   };
 
   return {
-    tab: new ClaudianSettingTab({} as any, plugin as any),
+    tab: new ClaudianSettingTab({} as any, {} as any, plugin as any),
     plugin,
   };
 }
@@ -187,7 +208,7 @@ interface MockContainer extends Record<string, any> {
   click(): void;
 }
 
-function createContainer(options: { text?: string } = {}): MockContainer {
+function createContainer(options: { text?: string; cls?: string } = {}): MockContainer {
   const listeners = new Map<string, () => void>();
   const children: MockContainer[] = [];
   const attributes = new Map<string, string>();
@@ -195,6 +216,7 @@ function createContainer(options: { text?: string } = {}): MockContainer {
     attributes,
     children,
     classList: {
+      contains: (name: string) => options?.cls?.split(' ').includes(name) ?? false,
       add: jest.fn(),
       remove: jest.fn(),
     },
@@ -240,14 +262,6 @@ function findContainer(root: MockContainer, text: string): MockContainer | null 
   return null;
 }
 
-function findContainerByClass(root: MockContainer, className: string): MockContainer | null {
-  if (root.cls === className) return root;
-  for (const child of root.children) {
-    const match = findContainerByClass(child, className);
-    if (match) return match;
-  }
-  return null;
-}
 
 function renderSettingsTab(
   tab: ClaudianSettingTab,
@@ -271,11 +285,50 @@ function renderSettingsTab(
 
 describe('ClaudianSettingTab display settings', () => {
   beforeEach(() => {
+    document.body.replaceChildren();
+    mockSkillsSettingsTab.mockClear();
     mockRenderedSettingNames.length = 0;
     mockSettingDescriptionEls.clear();
     mockGitStatusElements.length = 0;
     mockToggleChanges.clear();
     mockTextChanges.clear();
+  });
+
+  it('shows title eligibility guidance and updates it after selection and catalog changes', async () => {
+    jest.spyOn(ProviderRegistry, 'getTitleGenerationModelOptions').mockReturnValue([
+      { value: 'claude-code/sonnet', label: 'Claude: Sonnet' },
+    ]);
+    const eligibility = jest.spyOn(ProviderRegistry, 'resolveTitleGenerationSelection')
+      .mockImplementation(settings => settings.titleGenerationModel === 'claude-code/sonnet' ? { providerId: 'claude', model: 'claude-code/sonnet' } : null);
+    const { tab, plugin } = createTab(true);
+    plugin.settings.enableAutoTitleGeneration = true;
+    plugin.settings.titleGenerationModel = '';
+    renderSettingsTab(tab);
+    expect(within(document.body).getByRole('status').textContent).toBe(t('settings.titleModel.unavailableWarning'));
+    const menu = within(document.body).getByRole('combobox', { name: t('settings.titleModel.name') }) as HTMLSelectElement;
+    expect(within(menu).queryByRole('option', { name: /Auto/ })).toBeNull();
+    expect(menu.value).toBe('');
+    expect(menu.options[0].disabled).toBe(true);
+    expect(menu.required).toBe(true);
+    expect(plugin.mutateSettings).not.toHaveBeenCalled();
+    expect((await axe(menu.parentElement!)).violations).toEqual([]);
+    fireEvent.change(menu, { target: { value: 'claude-code/sonnet' } });
+    await waitFor(() => expect(within(document.body).queryByRole('status')).toBeNull());
+    await waitFor(() => expect(plugin.settings.titleGenerationModel).toBe('claude-code/sonnet'));
+    eligibility.mockReturnValue(null);
+    tab.refreshModelOptions();
+    expect(within(document.body).getByRole('status').textContent).toBe(t('settings.titleModel.unavailableWarning'));
+    eligibility.mockReturnValue({ providerId: 'claude', model: 'claude-code/sonnet' });
+    tab.refreshModelOptions();
+    expect(within(document.body).queryByRole('status')).toBeNull();
+    expect(await axe(menu.parentElement!)).toHaveNoViolations();
+  });
+
+  it('does not show title guidance when automatic titles are disabled', () => {
+    const { tab, plugin } = createTab(true);
+    plugin.settings.enableAutoTitleGeneration = false;
+    renderSettingsTab(tab);
+    expect(within(document.body).queryByRole('status')).toBeNull();
   });
 
   it('renders the custom settings surface through a declarative definition', () => {
@@ -294,6 +347,43 @@ describe('ClaudianSettingTab display settings', () => {
     expect(container.empty).toHaveBeenCalledTimes(1);
     expect(container.addClass).toHaveBeenCalledWith('claudian-settings');
     expect(findContainer(container, t('settings.tabs.general'))).not.toBeNull();
+    expect(findContainer(container, t('settings.tabs.providers'))).not.toBeNull();
+    expect(findContainer(container, t('settings.tabs.skills'))).not.toBeNull();
+  });
+
+  it('does not touch skill folders until the Skills tab is opened', () => {
+    const { tab, plugin } = createTab(true);
+    const container = renderSettingsTab(tab);
+
+    expect(plugin.storage.getAdapter).not.toHaveBeenCalled();
+    expect(mockSkillsSettingsTab).not.toHaveBeenCalled();
+    findContainer(container, t('settings.tabs.skills'))?.click();
+    findContainer(container, t('settings.tabs.skills'))?.click();
+
+    expect(plugin.storage.getAdapter).toHaveBeenCalledTimes(1);
+    expect(mockSkillsSettingsTab).toHaveBeenCalledTimes(1);
+  });
+
+  it('saves timestamp preferences through the application settings owner', async () => {
+    const { tab, plugin } = createTab(true);
+    const firstView = { refreshMessageTimestamps: jest.fn() };
+    const secondView = { refreshMessageTimestamps: jest.fn() };
+    plugin.getAllViews.mockReturnValue([firstView, secondView]);
+    let finishSave!: () => void;
+    plugin.mutateSettings.mockImplementation(async (mutation: (settings: typeof plugin.settings) => void) => {
+      mutation(plugin.settings);
+      await new Promise<void>(resolve => { finishSave = resolve; });
+    });
+    (tab as any).renderGeneralTab(createContainer());
+
+    const change = mockToggleChanges.get(t('settings.showMessageTimestamps.name'))!(true);
+    expect(firstView.refreshMessageTimestamps).not.toHaveBeenCalled();
+    expect(secondView.refreshMessageTimestamps).not.toHaveBeenCalled();
+    finishSave();
+    await change;
+
+    expect(plugin.settings.showMessageTimestamps).toBe(true);
+    expect(plugin.mutateSettings).toHaveBeenCalledTimes(1);
   });
 
   it('renders the dual-pane position only while dual-pane mode is enabled', () => {
@@ -302,6 +392,7 @@ describe('ClaudianSettingTab display settings', () => {
 
     expect(mockRenderedSettingNames).toContain(t('settings.dualPaneSide.name'));
 
+    document.body.replaceChildren();
     mockRenderedSettingNames.length = 0;
     const disabled = createTab(false);
     (disabled.tab as any).renderGeneralTab(createContainer());
@@ -321,158 +412,19 @@ describe('ClaudianSettingTab display settings', () => {
     expect(update).toHaveBeenCalledTimes(1);
   });
 
-  it('renders and updates the startup tab restore toggle', async () => {
+  it.each([
+    ['restoreTabsOnStartup', 'settings.restoreTabsOnStartup.name'],
+    ['enableZenMode', 'settings.enableZenMode.name'],
+  ] as const)('renders and updates the %s toggle', async (key, name) => {
     const { tab, plugin } = createTab(true);
     (tab as any).renderGeneralTab(createContainer());
 
-    expect(mockRenderedSettingNames).toContain(t('settings.restoreTabsOnStartup.name'));
+    expect(mockRenderedSettingNames).toContain(t(name));
+    expect(plugin.settings[key]).toBe(true);
 
-    await mockToggleChanges.get(t('settings.restoreTabsOnStartup.name'))?.(false);
+    await mockToggleChanges.get(t(name))!(false);
 
-    expect(plugin.settings.restoreTabsOnStartup).toBe(false);
-  });
-
-  it('keeps Collab controls out of General settings', () => {
-    const { tab, plugin } = createTab(true);
-    (tab as any).renderGeneralTab(createContainer());
-
-    expect(mockRenderedSettingNames).not.toContain(t('settings.collabEnabled.name'));
-    expect(mockRenderedSettingNames).not.toContain(t('settings.collabProjectsFolder.name'));
-    expect(mockRenderedSettingNames).not.toContain(t('settings.collabGitPath.name'));
-    expect(plugin.settings.collabEnabled).toBe(false);
-  });
-
-  it('delegates live enablement and Projects-folder validation from Collab settings', async () => {
-    const { tab, plugin } = createTab(true);
-    (tab as any).renderCollabTab(createContainer());
-
-    await mockToggleChanges.get(t('settings.collabEnabled.name'))?.(true);
-    await mockTextChanges.get(t('settings.collabProjectsFolder.name'))?.('  shared/projects  ');
-    await mockTextChanges.get(t('settings.collabProjectsFolder.name'))?.('../outside');
-
-    expect(plugin.setCollabEnabled).toHaveBeenCalledWith(true);
-    expect(plugin.settings.collabEnabled).toBe(true);
-    expect(plugin.setCollabProjectsFolder).toHaveBeenNthCalledWith(1, '  shared/projects  ');
-    expect(plugin.settings.collabProjectsFolder).toBe('shared/projects');
-  });
-
-  it('persists the Vault-scoped Native Git path from Collab settings', async () => {
-    const { tab, plugin } = createTab(true);
-    (tab as any).renderCollabTab(createContainer());
-
-    await mockTextChanges.get(t('settings.collabGitPath.name'))?.('  /usr/local/bin/git  ');
-
-    expect(plugin.settings.collabGitPath).toBe('/usr/local/bin/git');
-  });
-
-  it('shows Git detection status and debounces manual-path checks', async () => {
-    jest.useFakeTimers();
-    try {
-      const { tab, plugin } = createTab(true);
-      const activate = (tab as any).renderCollabTab(createContainer()) as () => void;
-
-      activate();
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(plugin.checkCollabGitInstallation).toHaveBeenCalledWith(false);
-      expect(mockGitStatusElements[0]?.parent).toBe('name');
-      expect(mockGitStatusElements[0]?.className)
-        .toContain('claudian-collab-git-path-status--available');
-
-      plugin.checkCollabGitInstallation.mockResolvedValueOnce('unavailable');
-      await mockTextChanges.get(t('settings.collabGitPath.name'))?.('/missing/git');
-      expect(mockGitStatusElements[0]?.className)
-        .toContain('claudian-collab-git-path-status--checking');
-      expect(plugin.checkCollabGitInstallation).toHaveBeenCalledTimes(1);
-
-      jest.advanceTimersByTime(300);
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(plugin.checkCollabGitInstallation).toHaveBeenLastCalledWith(true);
-      expect(mockGitStatusElements[0]?.className)
-        .toContain('claudian-collab-git-path-status--unavailable');
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
-  it('renders compact Git setup help and copies the prompt', async () => {
-    jest.useFakeTimers();
-    const writeText = jest.fn().mockResolvedValue(undefined);
-    const originalClipboard = navigator.clipboard;
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: { writeText },
-    });
-    const { tab } = createTab(true);
-    const container = createContainer();
-    try {
-      (tab as any).renderCollabTab(container);
-
-      expect(findContainer(container, t('settings.collabGitInstallation.summary')))
-        .not.toBeNull();
-      expect(findContainer(container, [
-        t('settings.collabGitInstallation.requirement'),
-        t('settings.collabGitInstallation.verify'),
-      ].join(' ')))
-        .not.toBeNull();
-      expect(findContainer(container, t('settings.collabGitInstallation.verify')))
-        .toBeNull();
-      expect(findContainer(container, t('settings.collabGitInstallation.prompt')))
-        .not.toBeNull();
-      expect(findContainerByClass(container, 'claudian-code-wrapper')).not.toBeNull();
-      expect(findContainerByClass(container, 'copy-code-button')).not.toBeNull();
-      expect(findContainerByClass(
-        container,
-        'claudian-collab-git-verification-row',
-      )).toBeNull();
-      expect(t('settings.collabGitInstallation.prompt')).toContain(
-        'Report whether Git is installed',
-      );
-      expect(t('settings.collabGitInstallation.prompt')).toContain(
-        'advise me how to install it on this device',
-      );
-      expect(t('settings.collabGitInstallation.prompt')).toBe([
-        'Check my Git installation on this computer.',
-        '1. Report whether Git is installed, the executable path, and the version.',
-        '2. If Git is not installed, advise me how to install it on this device.',
-        '3. Do not install or change anything.',
-      ].join('\n'));
-      expect(t('settings.collabGitInstallation.prompt')).not.toContain('Collab');
-      const copyButton = findContainerByClass(container, 'copy-code-button');
-      copyButton?.click();
-      await Promise.resolve();
-      expect(writeText).toHaveBeenCalledWith(
-        t('settings.collabGitInstallation.prompt'),
-      );
-      expect(copyButton?.setText).toHaveBeenCalledWith('Copied!');
-
-      const collabEnabledDescription = mockSettingDescriptionEls.get(
-        t('settings.collabEnabled.name'),
-      )!;
-      const readMore = findContainer(
-        collabEnabledDescription,
-        t('settings.collabReadMore'),
-      );
-      expect(readMore).not.toBeNull();
-      expect(findContainer(container, t('settings.collabReadMore'))).toBeNull();
-      expect(t('settings.collabReadMore')).toBe(
-        'Read more about Claudian Collab Mode',
-      );
-      expect(readMore?.attr).toEqual(expect.objectContaining({
-        href: 'https://claudian.md/docs/collab-mode/',
-        rel: 'noopener noreferrer',
-        target: '_blank',
-      }));
-      expect(readMore?.cls).toBe('claudian-collab-read-more-link');
-    } finally {
-      jest.runOnlyPendingTimers();
-      jest.useRealTimers();
-      Object.defineProperty(navigator, 'clipboard', {
-        configurable: true,
-        value: originalClipboard,
-      });
-    }
+    expect(plugin.settings[key]).toBe(false);
   });
 
   it('keeps Provider initialization lazy and does not mutate chat selection on navigation', async () => {
@@ -484,7 +436,6 @@ describe('ClaudianSettingTab display settings', () => {
     const ensureInitialized = jest.spyOn(ProviderWorkspaceRegistry, 'ensureInitialized')
       .mockResolvedValue(undefined);
     ensureInitialized.mockClear();
-    jest.spyOn(ProviderWorkspaceRegistry, 'prepareSettings').mockResolvedValue(undefined);
     jest.spyOn(ProviderWorkspaceRegistry, 'getSettingsTabRenderer').mockReturnValue(null);
     const { tab, plugin } = createTab(true);
     renderSettingsTab(tab);
@@ -512,7 +463,6 @@ describe('ClaudianSettingTab display settings', () => {
     const ensureInitialized = jest.spyOn(ProviderWorkspaceRegistry, 'ensureInitialized')
       .mockResolvedValue(undefined);
     ensureInitialized.mockClear();
-    jest.spyOn(ProviderWorkspaceRegistry, 'prepareSettings').mockResolvedValue(undefined);
     jest.spyOn(ProviderWorkspaceRegistry, 'getSettingsTabRenderer').mockReturnValue(null);
     const { tab } = createTab(true);
     const container = createContainer();
@@ -531,4 +481,62 @@ describe('ClaudianSettingTab display settings', () => {
     expect(ensureInitialized.mock.calls.map(([, providerId]) => providerId))
       .toEqual(['claude', 'codex']);
   });
+
+  it('collapses a disabled Provider tab and follows later enablement changes', async () => {
+    let enabled = false;
+    jest.spyOn(ProviderRegistry, 'getRegisteredProviderIds').mockReturnValue(['codex']);
+    jest.spyOn(ProviderRegistry, 'getProviderDisplayName').mockReturnValue('CODEX');
+    jest.spyOn(ProviderRegistry, 'getTitleGenerationModelOptions').mockReturnValue([]);
+    jest.spyOn(ProviderRegistry, 'isEnabled').mockImplementation(() => enabled);
+    jest.spyOn(ProviderWorkspaceRegistry, 'ensureInitialized').mockResolvedValue(undefined);
+    let notify: ((providerId: 'codex') => void) | null = null;
+    jest.spyOn(ProviderWorkspaceRegistry, 'getSettingsTabRenderer').mockReturnValue({
+      render: (_container, context) => { notify = context.notifyProviderModelOptionsChanged; },
+    });
+    const { tab, plugin } = createTab(true);
+    plugin.notifyProviderChatOptionsChanged = jest.fn();
+    const container = createContainer();
+    (tab as any).activeTab = 'providers';
+
+    renderSettingsTab(tab, container);
+    await waitFor(() => expect(notify).not.toBeNull());
+    const content = findByClass(container, 'claudian-settings-provider-content')!;
+    const collapsed = (): boolean | undefined => content.toggleClass.mock.calls
+      .filter(([name]: [string]) => name === 'claudian-settings-provider-content--disabled')
+      .at(-1)?.[1];
+    expect(collapsed()).toBe(true);
+
+    enabled = true;
+    notify!('codex');
+    expect(collapsed()).toBe(false);
+  });
+});
+
+function findByClass(root: MockContainer, cls: string): MockContainer | null {
+  if ((root.cls as string | undefined)?.split(' ').includes(cls)) return root;
+  for (const child of root.children) {
+    const match = findByClass(child, cls);
+    if (match) return match;
+  }
+  return null;
+}
+
+it('batches a burst of text edits into one settings mutation and flushes on teardown', async () => {
+  jest.useFakeTimers();
+  const { tab, plugin } = createTab(false);
+  const cleanup = (tab as any).renderSettings(createContainer());
+  try {
+    const change = mockTextChanges.get(t('settings.userName.name'))!;
+    for (let index = 0; index < 20; index++) await change(`Name ${index}`);
+    expect(plugin.mutateSettings).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(500);
+    expect(plugin.mutateSettings).toHaveBeenCalledTimes(1);
+    expect(plugin.settings.userName).toBe('Name 19');
+    await change('Last edit');
+    cleanup();
+    await Promise.resolve();
+    expect(plugin.settings.userName).toBe('Last edit');
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(plugin.mutateSettings).toHaveBeenCalledTimes(2);
+  } finally { cleanup(); jest.useRealTimers(); }
 });

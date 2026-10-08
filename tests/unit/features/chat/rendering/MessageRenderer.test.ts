@@ -1,7 +1,7 @@
 import '@/providers';
 
 import { createMockEl } from '@test/helpers/MockElement';
-import { Menu } from 'obsidian';
+import { Component, Menu } from 'obsidian';
 
 import {
   TOOL_AGENT_OUTPUT,
@@ -14,12 +14,12 @@ import {
 import type { ChatMessage, ImageAttachment } from '@/core/types';
 import { renderCitationGroup } from '@/features/chat/rendering/CitationRenderer';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
-import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat/rendering/SubagentRenderer';
 import { renderStoredThinkingBlock } from '@/features/chat/rendering/ThinkingBlockRenderer';
-import { renderStoredToolCall } from '@/features/chat/rendering/ToolCallRenderer';
-import { renderStoredWriteEdit } from '@/features/chat/rendering/WriteEditRenderer';
+import { renderStoredToolCall } from '@/features/chat/rendering/tools/ToolCallRenderer';
+import { renderStoredWriteEdit } from '@/features/chat/rendering/tools/WriteEditRenderer';
+import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat/subagents/SubagentRenderer';
 
-jest.mock('@/features/chat/rendering/SubagentRenderer', () => ({
+jest.mock('@/features/chat/subagents/SubagentRenderer', () => ({
   renderStoredAsyncSubagent: jest.fn().mockReturnValue({ wrapperEl: {}, cleanup: jest.fn() }),
   renderStoredSubagent: jest.fn(),
 }));
@@ -27,16 +27,16 @@ jest.mock('@/features/chat/rendering/ThinkingBlockRenderer', () => ({
   renderStoredThinkingBlock: jest.fn(),
 }));
 jest.mock('@/features/chat/rendering/CitationRenderer', () => ({
-  renderCitationGroup: jest.fn(),
+  renderCitationGroup: jest.fn((parent: HTMLElement) => parent.createDiv()),
 }));
-jest.mock('@/features/chat/rendering/ToolCallRenderer', () => ({
+jest.mock('@/features/chat/rendering/tools/ToolCallRenderer', () => ({
   renderStoredToolCall: jest.fn(),
 }));
-jest.mock('@/features/chat/rendering/WriteEditRenderer', () => ({
+jest.mock('@/features/chat/rendering/tools/WriteEditRenderer', () => ({
   renderStoredWriteEdit: jest.fn(),
 }));
 jest.mock('@/utils/imageEmbed', () => ({
-  replaceImageEmbedsWithHtml: jest.fn().mockImplementation((md: string) => md),
+  replaceImageEmbedsWithHTML: jest.fn().mockImplementation((md: string) => md),
 }));
 jest.mock('@/utils/fileLink', () => ({
   processFileLinks: jest.fn(),
@@ -44,25 +44,18 @@ jest.mock('@/utils/fileLink', () => ({
 }));
 
 function createMockComponent() {
-  return {
-    registerDomEvent: jest.fn(),
-    register: jest.fn(),
-    addChild: jest.fn(),
-    load: jest.fn(),
-    unload: jest.fn(),
-  };
+  return new Component();
 }
 
 function mockCapabilities(providerId: 'claude' | 'codex' | 'grok' = 'claude') {
   return () => ({
     providerId,
+    supportsEphemeralSessions: false,
     supportsNativeHistory: providerId === 'claude',
-    supportsPlanMode: true,
     supportsRewind: true,
     supportsFork: true,
     supportsProviderCommands: true,
     supportsImageAttachments: true,
-    supportsInstructionMode: true,
     reasoningControl: 'effort' as const,
   });
 }
@@ -191,6 +184,44 @@ describe('MessageRenderer', () => {
     expect(interruptedEl.textContent).toBe('Interrupted');
   });
 
+  it('renders timestamps when the setting is enabled', () => {
+    const messagesEl = createMockEl();
+    const { renderer } = createRenderer(messagesEl, 'claude', { showMessageTimestamps: true });
+    const timestamp = new Date('2026-08-12T10:30:00Z').getTime();
+
+    renderer.renderStoredMessage({
+      id: 'timed-user',
+      role: 'user',
+      content: 'Hello',
+      timestamp,
+    });
+
+    const msgEl = messagesEl.children[0];
+    const timestampEl = msgEl.querySelector('.claudian-message-timestamp');
+    expect(timestampEl).toBeTruthy();
+    expect(timestampEl.textContent).toBe(new Date(timestamp).toLocaleTimeString(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }));
+    expect(timestampEl.getAttribute('aria-label')).toBe(new Date(timestamp).toLocaleString(undefined, { hourCycle: 'h23' }));
+  });
+
+  it('does not render timestamps when the setting is disabled', () => {
+    const messagesEl = createMockEl();
+    const { renderer } = createRenderer(messagesEl, 'claude', { showMessageTimestamps: false });
+
+    renderer.renderStoredMessage({
+      id: 'untimed-user',
+      role: 'user',
+      content: 'Hello',
+      timestamp: Date.now(),
+    });
+
+    const msgEl = messagesEl.children[0];
+    expect(msgEl.querySelector('.claudian-message-timestamp')).toBeNull();
+  });
+
   it('renders persisted citation content blocks', () => {
     const messagesEl = createMockEl();
     const { renderer } = createRenderer(messagesEl, 'codex');
@@ -216,34 +247,6 @@ describe('MessageRenderer', () => {
     });
 
     expect(renderCitationGroup).toHaveBeenCalledWith(expect.anything(), citations);
-  });
-
-  it('upgrades a persisted legacy interruption marker to the typed indicator', async () => {
-    const { MarkdownRenderer } = await import('obsidian');
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-    const legacyMarker =
-      '<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>';
-    const interruptMsg: ChatMessage = {
-      id: 'interrupt-legacy-1',
-      role: 'assistant',
-      content: 'Partial response',
-      timestamp: Date.now(),
-      contentBlocks: [{ type: 'text', content: `Partial response\n\n${legacyMarker}` }],
-    };
-
-    renderer.renderStoredMessage(interruptMsg);
-
-    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
-      'Partial response',
-      expect.anything(),
-      '',
-      expect.anything()
-    );
-    const contentEl = messagesEl.children[0].children[0];
-    const indicatorEl = contentEl.children[contentEl.children.length - 1];
-    expect(indicatorEl.children[0].hasClass('claudian-interrupted')).toBe(true);
-    expect(indicatorEl.children[0].textContent).toBe('Interrupted');
   });
 
   it('renders bare interrupt marker for empty interrupted assistant message', () => {
@@ -344,7 +347,6 @@ describe('MessageRenderer', () => {
   it('skips empty user message bubble (image-only)', () => {
     const messagesEl = createMockEl();
     const { renderer } = createRenderer(messagesEl);
-    jest.spyOn(renderer, 'renderMessageImages').mockImplementation(() => {});
 
     const msg: ChatMessage = {
       id: 'u1',
@@ -357,7 +359,7 @@ describe('MessageRenderer', () => {
     renderer.renderStoredMessage(msg);
 
     // Images should still be rendered, but no message bubble
-    expect(renderer.renderMessageImages).toHaveBeenCalled();
+    expect(messagesEl.querySelector('.claudian-message-image')?.children[0]).not.toBeNull();
     // Only the images container, no message bubble
     const bubbles = messagesEl.children.filter(
       (c: any) => c.hasClass('claudian-message')
@@ -369,7 +371,6 @@ describe('MessageRenderer', () => {
     const messagesEl = createMockEl();
     const { renderer } = createRenderer(messagesEl);
     jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-    const renderImagesSpy = jest.spyOn(renderer, 'renderMessageImages').mockImplementation(() => {});
 
     const images: ImageAttachment[] = [
       { id: 'img-1', name: 'photo.png', mediaType: 'image/png', data: 'base64data', size: 200, source: 'file' },
@@ -385,24 +386,7 @@ describe('MessageRenderer', () => {
 
     renderer.renderStoredMessage(msg);
 
-    expect(renderImagesSpy).toHaveBeenCalledWith(messagesEl, images);
-  });
-
-  it('adds a rewind button for eligible stored user messages', () => {
-    const messagesEl = createMockEl();
-    const rewindCallback = jest.fn().mockResolvedValue(undefined);
-    const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, createMockComponent() as any, messagesEl, rewindCallback, undefined, mockCapabilities());
-    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-
-    const allMessages: ChatMessage[] = [
-      { id: 'a1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
-      { id: 'u1', role: 'user', content: 'hello', timestamp: 2, userMessageId: 'user-u' },
-      { id: 'a2', role: 'assistant', content: '', timestamp: 3, assistantMessageId: 'resp-a' },
-    ];
-
-    renderer.renderStoredMessage(allMessages[1], allMessages, 1);
-
-    expect(messagesEl.querySelector('.claudian-message-rewind-btn')).not.toBeNull();
+    expect(messagesEl.querySelector('.claudian-message-image')?.children[0]?.getAttribute('src')).toBe('data:image/png;base64,base64data');
   });
 
   it('adds rewind but not fork for a completed first user message', () => {
@@ -428,7 +412,6 @@ describe('MessageRenderer', () => {
 
     expect(messagesEl.querySelector('.claudian-message-rewind-btn')).not.toBeNull();
     expect(messagesEl.querySelector('.claudian-message-fork-btn')).toBeNull();
-    expect((renderer as any).liveMessageEls.has('u1')).toBe(false);
   });
 
   it('does not add a rewind button when stored render is called without context', () => {
@@ -450,7 +433,7 @@ describe('MessageRenderer', () => {
     expect(messagesEl.querySelector('.claudian-message-rewind-btn')).toBeNull();
   });
 
-  it('shows rewind mode menu for eligible streamed user messages', async () => {
+  it('positions the rewind menu for pointer and keyboard activation', async () => {
     const messagesEl = createMockEl();
     const rewindCallback = jest.fn().mockResolvedValue(undefined);
     const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '' } } as any, createMockComponent() as any, messagesEl, rewindCallback, undefined, mockCapabilities());
@@ -476,8 +459,14 @@ describe('MessageRenderer', () => {
     const btn = messagesEl.querySelector('.claudian-message-rewind-btn');
     expect(btn).not.toBeNull();
 
-    btn!.click();
+    const pointerEvent = {
+      detail: 1,
+      stopPropagation: jest.fn(),
+      type: 'click',
+    };
+    btn!.dispatchEvent(pointerEvent);
     const menu = (Menu as typeof Menu & { instances: any[] }).instances[0];
+    expect(menu.showAtMouseEvent).toHaveBeenCalledWith(pointerEvent);
     expect(menu.items.map((item: any) => item.title)).toEqual([
       'Rewind conversation only',
       'Rewind code + conversation',
@@ -487,6 +476,20 @@ describe('MessageRenderer', () => {
     await Promise.resolve();
 
     expect(rewindCallback).toHaveBeenCalledWith('u1', 'conversation');
+
+    btn!.getBoundingClientRect = jest.fn().mockReturnValue({ bottom: 48, left: 24 });
+    btn!.dispatchEvent({
+      detail: 0,
+      stopPropagation: jest.fn(),
+      type: 'click',
+    });
+
+    const keyboardMenu = (Menu as typeof Menu & { instances: any[] }).instances[1];
+    expect(keyboardMenu.showAtPosition).toHaveBeenCalledWith(
+      { x: 24, y: 48 },
+      btn!.ownerDocument,
+    );
+    expect(keyboardMenu.showAtMouseEvent).not.toHaveBeenCalled();
   });
 
   it('refreshes rewind but not fork for a streamed first user message', () => {
@@ -570,7 +573,11 @@ describe('MessageRenderer', () => {
 
     expect(renderStoredThinkingBlock).toHaveBeenCalled();
     expect(renderContentSpy).toHaveBeenCalledWith(expect.anything(), 'Text block');
-    // TodoWrite is not rendered inline - only in bottom panel
+    expect(renderStoredToolCall).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: 'todo', name: 'TodoWrite' }),
+      expect.objectContaining({ initiallyExpanded: false }),
+    );
     expect(renderStoredWriteEdit).toHaveBeenCalled();
     expect(renderStoredToolCall).toHaveBeenCalled();
     expect(renderStoredAsyncSubagent).toHaveBeenCalled();
@@ -599,7 +606,7 @@ describe('MessageRenderer', () => {
     expect(renderStoredWriteEdit).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ id: 'edit-1', name: 'Edit' }),
-      { initiallyExpanded: false },
+      expect.objectContaining({ initiallyExpanded: false }),
     );
   });
 
@@ -625,7 +632,7 @@ describe('MessageRenderer', () => {
     expect(renderStoredWriteEdit).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ id: 'write-1', name: 'Write' }),
-      { initiallyExpanded: true },
+      expect.objectContaining({ initiallyExpanded: true }),
     );
   });
 
@@ -714,7 +721,7 @@ describe('MessageRenderer', () => {
         name: TOOL_WRITE_STDIN,
         input: { session_id: '2404', chars: 'y\n' },
       }),
-      { initiallyExpanded: false },
+      expect.objectContaining({ initiallyExpanded: false }),
     );
     expect(messagesEl.children).toHaveLength(1);
   });
@@ -747,86 +754,8 @@ describe('MessageRenderer', () => {
     expect(renderStoredToolCall).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ id: 'patch-1', name: TOOL_APPLY_PATCH }),
-      { initiallyExpanded: true },
+      expect.objectContaining({ initiallyExpanded: true }),
     );
-  });
-
-  it('renders response duration footer when durationSeconds is present', () => {
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-
-    const msg: ChatMessage = {
-      id: 'm1',
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-      contentBlocks: [
-        { type: 'text', content: 'Response text' } as any,
-      ],
-      durationSeconds: 65,
-      durationFlavorWord: 'Baked',
-    };
-
-    renderer.renderStoredMessage(msg);
-
-    // Find the footer element
-    const msgEl = messagesEl.children[0];
-    const contentEl = msgEl.children[0]; // claudian-message-content
-    const footerEl = contentEl.children.find((c: any) => c.hasClass('claudian-response-footer'));
-    expect(footerEl).toBeDefined();
-    const durationSpan = footerEl!.children[0];
-    expect(durationSpan.textContent).toContain('Baked');
-    expect(durationSpan.textContent).toContain('1m 5s');
-  });
-
-  it('does not render footer when durationSeconds is 0', () => {
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-
-    const msg: ChatMessage = {
-      id: 'm1',
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-      contentBlocks: [
-        { type: 'text', content: 'Response' } as any,
-      ],
-      durationSeconds: 0,
-    };
-
-    renderer.renderStoredMessage(msg);
-
-    const msgEl = messagesEl.children[0];
-    const contentEl = msgEl.children[0];
-    const footerEl = contentEl.children.find((c: any) => c.hasClass('claudian-response-footer'));
-    expect(footerEl).toBeUndefined();
-  });
-
-  it('uses default flavor word "Baked" when durationFlavorWord is not set', () => {
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-
-    const msg: ChatMessage = {
-      id: 'm1',
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-      contentBlocks: [
-        { type: 'text', content: 'Response' } as any,
-      ],
-      durationSeconds: 30,
-    };
-
-    renderer.renderStoredMessage(msg);
-
-    const msgEl = messagesEl.children[0];
-    const contentEl = msgEl.children[0];
-    const footerEl = contentEl.children.find((c: any) => c.hasClass('claudian-response-footer'));
-    expect(footerEl).toBeDefined();
-    expect(footerEl!.children[0].textContent).toContain('Baked');
   });
 
   it('renders fallback content for old conversations without contentBlocks', () => {
@@ -881,7 +810,7 @@ describe('MessageRenderer', () => {
     expect(renderStoredToolCall).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ id: 'read-1', name: 'Read' }),
-      { initiallyExpanded: false },
+      expect.objectContaining({ initiallyExpanded: false }),
     );
   });
 
@@ -969,42 +898,6 @@ describe('MessageRenderer', () => {
       })
     );
     expect(renderStoredSubagent).not.toHaveBeenCalled();
-  });
-
-  it('infers async running state from structured Task result content', () => {
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-
-    (renderStoredAsyncSubagent as jest.Mock).mockClear();
-
-    const msg: ChatMessage = {
-      id: 'm-task-async-structured',
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-      toolCalls: [
-        {
-          id: 'task-async-structured-1',
-          name: TOOL_SUBAGENT,
-          input: { description: 'Background task', run_in_background: true },
-          status: 'completed',
-          result: [{ type: 'text', text: '{"status":"running"}' }] as any,
-        } as any,
-      ],
-      contentBlocks: [
-        { type: 'tool_use', toolId: 'task-async-structured-1' } as any,
-      ],
-    };
-
-    renderer.renderStoredMessage(msg);
-
-    expect(renderStoredAsyncSubagent).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        id: 'task-async-structured-1',
-        asyncStatus: 'running',
-      })
-    );
   });
 
   it('uses subagent block mode hint when linked subagent mode is missing', () => {
@@ -1110,12 +1003,12 @@ describe('MessageRenderer', () => {
     expect(renderStoredToolCall).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ id: 'read-1', name: 'Read' }),
-      { initiallyExpanded: false },
+      expect.objectContaining({ initiallyExpanded: false }),
     );
     expect(renderStoredToolCall).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ id: 'grep-1', name: 'Grep' }),
-      { initiallyExpanded: false },
+      expect.objectContaining({ initiallyExpanded: false }),
     );
   });
 
@@ -1161,7 +1054,6 @@ describe('MessageRenderer', () => {
     const messagesEl = createMockEl();
     const { renderer } = createRenderer(messagesEl);
     jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-    const renderImagesSpy = jest.spyOn(renderer, 'renderMessageImages').mockImplementation(() => {});
 
     const images: ImageAttachment[] = [
       { id: 'img-1', name: 'photo.png', mediaType: 'image/png', data: 'base64data', size: 200, source: 'file' },
@@ -1177,13 +1069,12 @@ describe('MessageRenderer', () => {
 
     renderer.addMessage(msg);
 
-    expect(renderImagesSpy).toHaveBeenCalledWith(messagesEl, images);
+    expect(messagesEl.querySelector('.claudian-message-image')?.children[0]?.getAttribute('src')).toBe('data:image/png;base64,base64data');
   });
 
   it('addMessage skips empty bubble for image-only user messages', () => {
     const messagesEl = createMockEl();
     const { renderer } = createRenderer(messagesEl);
-    jest.spyOn(renderer, 'renderMessageImages').mockImplementation(() => {});
     const scrollSpy = jest.spyOn(renderer, 'scrollToBottom').mockImplementation(() => {});
 
     const msg: ChatMessage = {
@@ -1218,48 +1109,30 @@ describe('MessageRenderer', () => {
   });
 
   // ============================================
-  // setMessagesEl
-  // ============================================
-
-  it('setMessagesEl updates the container element', () => {
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-    const newEl = createMockEl();
-
-    renderer.setMessagesEl(newEl);
-
-    // Verify by using scrollToBottom which references messagesEl
-    renderer.scrollToBottom();
-    // The new element should have been used (scrollTop set)
-    expect(newEl.scrollTop).toBe(newEl.scrollHeight);
-  });
-
-  // ============================================
   // Image rendering
   // ============================================
 
-  it('renderMessageImages creates image elements', () => {
+  it('renders every image attachment', () => {
     const containerEl = createMockEl();
-    const { renderer } = createRenderer();
-    jest.spyOn(renderer, 'setImageSrc').mockImplementation(() => {});
+    const { renderer } = createRenderer(containerEl);
 
     const images: ImageAttachment[] = [
       { id: 'img-1', name: 'photo.png', mediaType: 'image/png', data: 'base64data1', size: 200, source: 'file' },
       { id: 'img-2', name: 'avatar.jpg', mediaType: 'image/jpeg', data: 'base64data2', size: 300, source: 'file' },
     ];
 
-    renderer.renderMessageImages(containerEl, images);
+    renderer.addMessage({ id: 'image-message', role: 'user', content: '', timestamp: Date.now(), images });
 
     // Should create images container with 2 image wrappers
     expect(containerEl.children.length).toBe(1);
     const imagesContainer = containerEl.children[0];
     expect(imagesContainer.hasClass('claudian-message-images')).toBe(true);
-    expect(imagesContainer.children.length).toBe(2);
+    expect(imagesContainer.children.filter((child: any) => child.hasClass('claudian-message-image'))).toHaveLength(2);
   });
 
-  it('setImageSrc sets data URI on image element', () => {
-    const { renderer } = createRenderer();
-    const imgEl = createMockEl('img');
+  it('renders the attachment data URI', () => {
+    const messagesEl = createMockEl();
+    const { renderer } = createRenderer(messagesEl);
 
     const image: ImageAttachment = {
       id: 'img-1',
@@ -1270,55 +1143,10 @@ describe('MessageRenderer', () => {
       source: 'file',
     };
 
-    renderer.setImageSrc(imgEl as any, image);
+    renderer.addMessage({ id: 'image-message', role: 'user', content: '', timestamp: Date.now(), images: [image] });
+    const imgEl = messagesEl.querySelector('.claudian-message-image')!.children[0];
 
     expect(imgEl.getAttribute('src')).toBe('data:image/png;base64,abc123');
-  });
-
-  it('showFullImage opens a preview that disposal closes without allowing another', () => {
-    const { renderer } = createRenderer();
-    const image: ImageAttachment = {
-      id: 'img-1',
-      name: 'test.png',
-      mediaType: 'image/png',
-      data: 'abc123',
-      size: 100,
-      source: 'file',
-    };
-
-    const overlayEl = createMockEl();
-    const removeOverlay = jest.spyOn(overlayEl, 'remove');
-    const mockBody = { createDiv: jest.fn().mockReturnValue(overlayEl) };
-    const origDocument = globalThis.document;
-    (globalThis as any).document = { body: mockBody, addEventListener: jest.fn(), removeEventListener: jest.fn() };
-
-    try {
-      renderer.showFullImage(image);
-      expect(mockBody.createDiv).toHaveBeenCalledWith({ cls: 'claudian-image-modal-overlay' });
-
-      renderer.dispose();
-      renderer.showFullImage(image);
-
-      expect(removeOverlay).toHaveBeenCalledTimes(1);
-      expect(mockBody.createDiv).toHaveBeenCalledTimes(1);
-    } finally {
-      (globalThis as any).document = origDocument;
-    }
-  });
-
-  // ============================================
-  // Copy button
-  // ============================================
-
-  it('addTextCopyButton adds a copy button element', () => {
-    const textEl = createMockEl();
-    const { renderer } = createRenderer();
-
-    renderer.addTextCopyButton(textEl, 'some markdown');
-
-    expect(textEl.children.length).toBe(1);
-    const copyBtn = textEl.children[0];
-    expect(copyBtn.hasClass('claudian-text-copy-btn')).toBe(true);
   });
 
   // ============================================
@@ -1370,190 +1198,8 @@ describe('MessageRenderer', () => {
   });
 
   // ============================================
-  // renderContent
-  // ============================================
-
-  it('renderContent should not throw on valid markdown', async () => {
-    const { renderer } = createRenderer();
-    const el = createMockEl();
-
-    // Should not throw even if internal rendering fails (graceful error handling)
-    await expect(renderer.renderContent(el, '**Hello** world')).resolves.not.toThrow();
-  });
-
-  it('renderContent should empty the element before rendering', async () => {
-    const { renderer } = createRenderer();
-    const el = createMockEl();
-    el.createDiv({ text: 'old content' });
-    expect(el.children.length).toBe(1);
-
-    await renderer.renderContent(el, 'new content');
-
-    // After render, old content should be gone (empty() was called before rendering)
-    expect(el.children.length).toBe(0);
-  });
-
-  it('renderContent should skip file-link post-processing when markdown has no wikilinks', async () => {
-    const { processFileLinks } = await import('@/utils/fileLink');
-    const { renderer } = createRenderer();
-    const el = createMockEl();
-
-    await renderer.renderContent(el, 'plain markdown without links');
-
-    expect(processFileLinks).not.toHaveBeenCalled();
-  });
-
-  it('renderContent escapes math delimiters only when requested for streaming', async () => {
-    const { MarkdownRenderer } = await import('obsidian');
-    const { renderer } = createRenderer();
-    const el = createMockEl();
-
-    await renderer.renderContent(
-      el,
-      'Live $x + y$ and `echo $PATH`',
-      { deferMath: true }
-    );
-
-    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
-      'Live \\$x + y\\$ and `echo $PATH`',
-      el,
-      '',
-      expect.anything()
-    );
-  });
-
-  it('renderContent normalizes LaTeX math delimiters before rendering', async () => {
-    const { MarkdownRenderer } = await import('obsidian');
-    const { renderer } = createRenderer();
-    const el = createMockEl();
-
-    await renderer.renderContent(el, 'Inline \\(x<y\\).\n\\[y^2\\]');
-
-    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
-      'Inline $x<y$.\n$$y^2$$',
-      el,
-      '',
-      expect.anything()
-    );
-  });
-
-  it('renderContent escapes placeholder-style HTML before rendering', async () => {
-    const { MarkdownRenderer } = await import('obsidian');
-    const { replaceImageEmbedsWithHtml } = await import('@/utils/imageEmbed');
-    const { renderer } = createRenderer();
-    const el = createMockEl();
-    const markdown =
-      'Use areas/<meta-name> and projects/<meta-name>/<name>.';
-    const escapedMarkdown =
-      'Use areas/&lt;meta-name&gt; and projects/&lt;meta-name&gt;/&lt;name&gt;.';
-
-    await renderer.renderContent(el, markdown);
-
-    expect(replaceImageEmbedsWithHtml).toHaveBeenCalledWith(
-      escapedMarkdown,
-      expect.anything(),
-      { mediaFolder: '' }
-    );
-    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
-      escapedMarkdown,
-      el,
-      '',
-      expect.anything()
-    );
-  });
-
-  // ============================================
-  // addTextCopyButton - click behavior
-  // ============================================
-
-  describe('addTextCopyButton - click behavior', () => {
-    let originalNavigator: Navigator;
-
-    beforeEach(() => {
-      originalNavigator = globalThis.navigator;
-      jest.useFakeTimers();
-    });
-
-    afterEach(() => {
-      jest.useRealTimers();
-      Object.defineProperty(globalThis, 'navigator', {
-        value: originalNavigator,
-        writable: true,
-        configurable: true,
-      });
-    });
-
-    it('click should copy and show feedback', async () => {
-      const { renderer } = createRenderer();
-      const textEl = createMockEl();
-
-      const writeTextMock = jest.fn().mockResolvedValue(undefined);
-      Object.defineProperty(globalThis, 'navigator', {
-        value: { clipboard: { writeText: writeTextMock } },
-        writable: true,
-        configurable: true,
-      });
-
-      renderer.addTextCopyButton(textEl, 'markdown content');
-
-      const copyBtn = textEl.children[0];
-      expect(copyBtn.hasClass('claudian-text-copy-btn')).toBe(true);
-
-      // Simulate click
-      const clickHandlers = copyBtn._eventListeners.get('click');
-      expect(clickHandlers).toBeDefined();
-
-      await clickHandlers![0]({ stopPropagation: jest.fn() });
-
-      expect(writeTextMock).toHaveBeenCalledWith('markdown content');
-      expect(copyBtn.textContent).toBe('Copied!');
-      expect(copyBtn.classList.contains('copied')).toBe(true);
-    });
-
-    it('should handle clipboard API failure gracefully', async () => {
-      const { renderer } = createRenderer();
-      const textEl = createMockEl();
-
-      const writeTextMock = jest.fn().mockRejectedValue(new Error('not allowed'));
-      Object.defineProperty(globalThis, 'navigator', {
-        value: { clipboard: { writeText: writeTextMock } },
-        writable: true,
-        configurable: true,
-      });
-
-      renderer.addTextCopyButton(textEl, 'content');
-
-      const copyBtn = textEl.children[0];
-      const clickHandlers = copyBtn._eventListeners.get('click');
-
-      // Should not throw
-      await clickHandlers![0]({ stopPropagation: jest.fn() });
-
-      // Should not show feedback on error
-      expect(copyBtn.textContent).not.toBe('copied!');
-    });
-  });
-
-  // ============================================
   // renderMessages (entry point)
   // ============================================
-
-  it('renderMessages should render stored messages and return welcome element', () => {
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-    jest.spyOn(renderer, 'renderMessageImages').mockImplementation(() => {});
-
-    const messages: ChatMessage[] = [
-      { id: 'u1', role: 'user', content: 'Hello', timestamp: Date.now() },
-      { id: 'a1', role: 'assistant', content: 'Hi there', timestamp: Date.now(), contentBlocks: [{ type: 'text', content: 'Hi there' }] as any },
-    ];
-
-    const welcomeEl = renderer.renderMessages(messages, () => 'Good morning!');
-
-    expect(welcomeEl).toBeDefined();
-    expect(welcomeEl!.hasClass('claudian-welcome')).toBe(true);
-  });
 
   it('renderMessages should store table-of-contents title from displayContent before content', () => {
     const messagesEl = createMockEl();
@@ -1576,148 +1222,11 @@ describe('MessageRenderer', () => {
     expect(msgEl?.getAttribute('data-toc-title')).toBe('Visible slash command');
   });
 
-  it('renderMessages should hide welcome when messages exist', () => {
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
-    jest.spyOn(renderer, 'renderMessageImages').mockImplementation(() => {});
-
-    const messages: ChatMessage[] = [
-      { id: 'u1', role: 'user', content: 'Hello', timestamp: Date.now() },
-    ];
-
-    const welcomeEl = renderer.renderMessages(messages, () => 'Hello');
-
-    // When messages exist, welcome should be hidden
-    expect(welcomeEl).toBeDefined();
-  });
-
-  it('renderMessages should return welcome element when no messages', () => {
-    const messagesEl = createMockEl();
-    const { renderer } = createRenderer(messagesEl);
-
-    const welcomeEl = renderer.renderMessages([], () => 'Welcome');
-
-    expect(welcomeEl).toBeDefined();
-    expect(welcomeEl!.hasClass('claudian-welcome')).toBe(true);
-  });
-
   // ============================================
   // Agent tool rendering - error and running status
   // ============================================
 
   describe('Agent tool rendering - error and running status', () => {
-    it('renders Agent tool with error status as subagent with status error', () => {
-      const messagesEl = createMockEl();
-      const { renderer } = createRenderer(messagesEl);
-
-      (renderStoredSubagent as jest.Mock).mockClear();
-
-      const msg: ChatMessage = {
-        id: 'm1',
-        role: 'assistant',
-        content: '',
-        timestamp: Date.now(),
-        toolCalls: [
-          {
-            id: 'task-err',
-            name: TOOL_SUBAGENT,
-            input: { description: 'Failing task' },
-            status: 'error',
-            result: 'Something went wrong',
-          } as any,
-        ],
-        contentBlocks: [
-          { type: 'tool_use', toolId: 'task-err' } as any,
-        ],
-      };
-
-      renderer.renderStoredMessage(msg);
-
-      expect(renderStoredSubagent).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          id: 'task-err',
-          description: 'Failing task',
-          status: 'error',
-          result: 'Something went wrong',
-        })
-      );
-    });
-
-    it('renders Agent tool with running status (default case in switch)', () => {
-      const messagesEl = createMockEl();
-      const { renderer } = createRenderer(messagesEl);
-
-      (renderStoredSubagent as jest.Mock).mockClear();
-
-      const msg: ChatMessage = {
-        id: 'm1',
-        role: 'assistant',
-        content: '',
-        timestamp: Date.now(),
-        toolCalls: [
-          {
-            id: 'task-run',
-            name: TOOL_SUBAGENT,
-            input: { description: 'Running task' },
-            status: 'pending',
-          } as any,
-        ],
-        contentBlocks: [
-          { type: 'tool_use', toolId: 'task-run' } as any,
-        ],
-      };
-
-      renderer.renderStoredMessage(msg);
-
-      expect(renderStoredSubagent).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          id: 'task-run',
-          description: 'Running task',
-          status: 'running',
-        })
-      );
-    });
-
-    it('renders Agent tool with no description using the fallback label', () => {
-      const messagesEl = createMockEl();
-      const { renderer } = createRenderer(messagesEl);
-
-      (renderStoredSubagent as jest.Mock).mockClear();
-
-      const msg: ChatMessage = {
-        id: 'm1',
-        role: 'assistant',
-        content: '',
-        timestamp: Date.now(),
-        toolCalls: [
-          {
-            id: 'task-no-desc',
-            name: TOOL_SUBAGENT,
-            input: {},
-            status: 'completed',
-            result: 'Done',
-          } as any,
-        ],
-        contentBlocks: [
-          { type: 'tool_use', toolId: 'task-no-desc' } as any,
-        ],
-      };
-
-      renderer.renderStoredMessage(msg);
-
-      expect(renderStoredSubagent).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          id: 'task-no-desc',
-          description: 'Subagent task',
-          status: 'completed',
-        })
-      );
-    });
-
     it('renders Codex spawn_agent with the same prompt and result recovered on reload', () => {
       const messagesEl = createMockEl();
       const { renderer } = createRenderer(messagesEl, 'codex');
@@ -1897,284 +1406,44 @@ describe('MessageRenderer', () => {
   });
 
   // ============================================
-  // renderContent - code block wrapping (error path)
+  // Image previews
   // ============================================
 
-  describe('renderContent - error handling', () => {
-    it('renderContent shows error div when MarkdownRenderer throws', async () => {
-      const { MarkdownRenderer } = await import('obsidian');
-      (MarkdownRenderer.renderMarkdown as jest.Mock).mockRejectedValueOnce(
-        new Error('Render failed')
-      );
+  describe('message image previews', () => {
+    it('opens the preview from a native named button and closes it on disposal', () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl);
+      const image: ImageAttachment = {
+        id: 'img-1', name: 'photo.png', mediaType: 'image/png', data: 'base64data', size: 200, source: 'file',
+      };
+      renderer.addMessage({ id: 'u1', role: 'user', content: '', timestamp: Date.now(), images: [image] });
 
-      const { renderer } = createRenderer();
-      const el = createMockEl();
-
-      await renderer.renderContent(el, '**broken markdown**');
-
-      const errorDiv = el.children.find(
-        (c: any) => c.hasClass('claudian-render-error')
-      );
-      expect(errorDiv).toBeDefined();
-      expect(errorDiv!.textContent).toBe('Failed to render message content.');
-    });
-  });
-
-  // ============================================
-  // addTextCopyButton - rapid click handling
-  // ============================================
-
-  describe('addTextCopyButton - rapid click handling', () => {
-    let originalNavigator: Navigator;
-
-    beforeEach(() => {
-      originalNavigator = globalThis.navigator;
-      jest.useFakeTimers();
-      Object.defineProperty(globalThis, 'navigator', {
-        value: { clipboard: { writeText: jest.fn().mockResolvedValue(undefined) } },
-        writable: true,
-        configurable: true,
-      });
-    });
-
-    afterEach(() => {
-      jest.useRealTimers();
-      Object.defineProperty(globalThis, 'navigator', {
-        value: originalNavigator,
-        writable: true,
-        configurable: true,
-      });
-    });
-
-    it('rapid clicks clear previous timeout', async () => {
-      const { renderer } = createRenderer();
-      const textEl = createMockEl();
-      const clearTimeoutSpy = jest.spyOn(globalThis, 'clearTimeout');
-
-      renderer.addTextCopyButton(textEl, 'content to copy');
-
-      const copyBtn = textEl.children[0];
-      const clickHandlers = copyBtn._eventListeners.get('click');
-      expect(clickHandlers).toBeDefined();
-
-      // First click
-      await clickHandlers![0]({ stopPropagation: jest.fn() });
-      expect(copyBtn.textContent).toBe('Copied!');
-
-      // Second rapid click before timeout expires
-      await clickHandlers![0]({ stopPropagation: jest.fn() });
-
-      // clearTimeout should have been called for the first pending timeout
-      expect(clearTimeoutSpy).toHaveBeenCalled();
-      expect(copyBtn.textContent).toBe('Copied!');
-
-      clearTimeoutSpy.mockRestore();
-    });
-
-    it('feedback timeout restores icon after delay', async () => {
-      const { renderer } = createRenderer();
-      const textEl = createMockEl();
-
-      renderer.addTextCopyButton(textEl, 'content to copy');
-
-      const copyBtn = textEl.children[0];
-      const originalInnerHTML = copyBtn.innerHTML;
-      const clickHandlers = copyBtn._eventListeners.get('click');
-
-      // Click to copy
-      await clickHandlers![0]({ stopPropagation: jest.fn() });
-      expect(copyBtn.textContent).toBe('Copied!');
-      expect(copyBtn.classList.contains('copied')).toBe(true);
-
-      // Advance timers by 1500ms (the feedback duration)
-      jest.advanceTimersByTime(1500);
-
-      // Icon should be restored and copied class removed
-      expect(copyBtn.innerHTML).toBe(originalInnerHTML);
-      expect(copyBtn.classList.contains('copied')).toBe(false);
-    });
-  });
-
-  // ============================================
-  // renderContent - code block wrapping
-  // ============================================
-
-  describe('renderContent - code block wrapping', () => {
-    it('passes image-processed markdown directly to MarkdownRenderer', async () => {
-      const { MarkdownRenderer } = await import('obsidian');
-      const { replaceImageEmbedsWithHtml } = await import('@/utils/imageEmbed');
-      const { processFileLinks } = await import('@/utils/fileLink');
-      const { renderer } = createRenderer();
-      const el = createMockEl();
-
-      (replaceImageEmbedsWithHtml as jest.Mock).mockReturnValueOnce(
-        '<span title="[[note.md]]">raw html</span>\n    [[note.md]]'
-      );
-
-      await renderer.renderContent(el, 'before-images ![[image.png]] [[note.md]]');
-
-      expect(replaceImageEmbedsWithHtml).toHaveBeenCalledWith(
-        'before-images ![[image.png]] [[note.md]]',
-        expect.anything(),
-        { mediaFolder: '' }
-      );
-      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
-        '<span title="[[note.md]]">raw html</span>\n    [[note.md]]',
-        el,
-        '',
-        expect.anything()
-      );
-      expect(processFileLinks).toHaveBeenCalledWith(expect.anything(), el);
-    });
-
-    it('should wrap pre elements in code wrapper divs', async () => {
-      const { MarkdownRenderer } = await import('obsidian');
-      const { renderer } = createRenderer();
-      const el = createMockEl();
-
-      // Mock renderMarkdown to create a pre element in the container
-      (MarkdownRenderer.renderMarkdown as jest.Mock).mockImplementationOnce(
-        async (_md: string, container: any) => {
-          const pre = container.createEl('pre');
-          pre.createEl('code', { text: 'console.log("hello")' });
-        }
-      );
-
-      await renderer.renderContent(el, '```js\nconsole.log("hello")\n```');
-
-      // The pre should be wrapped in a claudian-code-wrapper
-      // Due to mock limitations, check that querySelectorAll was called on el
-      // The actual wrapping logic runs on real DOM, but the mock captures calls
-      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalled();
-    });
-
-    it('should skip wrapping already-wrapped pre elements', async () => {
-      const { MarkdownRenderer } = await import('obsidian');
-      const { renderer } = createRenderer();
-      const el = createMockEl();
-
-      // Mock renderMarkdown to create an already-wrapped pre element
-      (MarkdownRenderer.renderMarkdown as jest.Mock).mockImplementationOnce(
-        async (_md: string, container: any) => {
-          const wrapper = container.createDiv({ cls: 'claudian-code-wrapper' });
-          wrapper.createEl('pre');
-        }
-      );
-
-      await renderer.renderContent(el, '```\nalready wrapped\n```');
-
-      // Should not throw and should complete normally
-      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalled();
-    });
-  });
-
-  // ============================================
-  // renderMessageImages - preview control
-  // ============================================
-
-  describe('renderMessageImages - preview control', () => {
-    it('opens the preview from a native named button', () => {
-      const containerEl = createMockEl();
-      const { renderer } = createRenderer();
-      const showFullImageSpy = jest.spyOn(renderer, 'showFullImage').mockImplementation(() => {});
-      jest.spyOn(renderer, 'setImageSrc').mockImplementation(() => {});
-
-      const images: ImageAttachment[] = [
-        { id: 'img-1', name: 'photo.png', mediaType: 'image/png', data: 'base64data', size: 200, source: 'file' },
-      ];
-
-      renderer.renderMessageImages(containerEl, images);
-
-      // Find the img element and check for click handler
-      const imagesContainer = containerEl.children[0];
-      const previewButton = imagesContainer.children[0];
+      const previewButton = messagesEl.querySelector('.claudian-message-image')!;
       const imgEl = previewButton.children[0];
-
       expect(previewButton.tagName).toBe('BUTTON');
       expect(previewButton.getAttribute('type')).toBe('button');
       expect(previewButton.getAttribute('aria-label')).toBe('Preview photo.png');
       expect(imgEl.tagName).toBe('IMG');
       expect(imgEl.getAttribute('alt')).toBe('photo.png');
+      expect(imgEl.getAttribute('src')).toBe('data:image/png;base64,base64data');
 
-      const clickHandlers = previewButton._eventListeners?.get('click');
-      expect(clickHandlers).toBeDefined();
-      expect(clickHandlers!.length).toBe(1);
+      const overlayEl = createMockEl();
+      const removeOverlay = jest.spyOn(overlayEl, 'remove');
+      const mockBody = { createDiv: jest.fn().mockReturnValue(overlayEl) };
+      const origDocument = globalThis.document;
+      (globalThis as any).document = { body: mockBody, addEventListener: jest.fn(), removeEventListener: jest.fn() };
+      try {
+        previewButton.click();
+        expect(mockBody.createDiv).toHaveBeenCalledWith({ cls: 'claudian-image-modal-overlay' });
 
-      clickHandlers![0]();
-      expect(showFullImageSpy).toHaveBeenCalledWith(images[0]);
-    });
-  });
+        renderer.dispose();
+        previewButton.click();
 
-  // ============================================
-  // renderContent - code block wrapping with language labels
-  // ============================================
-
-  describe('renderContent - language label and copy', () => {
-    it('renders fenced languages through inert placeholders and restores highlighting', async () => {
-      const { loadPrism, MarkdownRenderer } = await import('obsidian');
-      const { renderer } = createRenderer();
-      const el = createMockEl();
-      const highlightElement = jest.fn();
-      let code: ReturnType<typeof createMockEl> | null = null;
-      (loadPrism as jest.Mock).mockResolvedValueOnce({ highlightElement });
-
-      (MarkdownRenderer.renderMarkdown as jest.Mock).mockImplementationOnce(
-        async (renderedMarkdown: string, container: any) => {
-          const language = renderedMarkdown.match(/^```([^\n]+)/)?.[1];
-          const pre = container.createEl('pre');
-          code = pre.createEl('code', {
-            cls: `language-${language}`,
-            text: 'TABLE file.name',
-          });
-        }
-      );
-
-      await renderer.renderContent(el, '```dataview\nTABLE file.name\n```');
-
-      const renderedMarkdown = (MarkdownRenderer.renderMarkdown as jest.Mock).mock.calls[0][0];
-      expect(renderedMarkdown).toContain('```claudian-display-only-fence-0');
-      expect(renderedMarkdown).not.toContain('```dataview');
-      expect(code?.hasClass('language-dataview')).toBe(true);
-      expect(code?.hasClass('language-claudian-display-only-fence-0')).toBe(false);
-      expect(highlightElement).toHaveBeenCalledWith(code);
-    });
-
-    it('should add language label when code block has language class', async () => {
-      const { MarkdownRenderer } = await import('obsidian');
-      const { renderer } = createRenderer();
-      const el = createMockEl();
-
-      (MarkdownRenderer.renderMarkdown as jest.Mock).mockImplementationOnce(
-        async (_md: string, container: any) => {
-          const pre = container.createEl('pre');
-          const code = pre.createEl('code');
-          code.className = 'language-typescript';
-          code.textContent = 'const x = 1;';
-        }
-      );
-
-      await renderer.renderContent(el, '```typescript\nconst x = 1;\n```');
-
-      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalled();
-    });
-
-    it('should move copy-code-button outside pre into wrapper', async () => {
-      const { MarkdownRenderer } = await import('obsidian');
-      const { renderer } = createRenderer();
-      const el = createMockEl();
-
-      (MarkdownRenderer.renderMarkdown as jest.Mock).mockImplementationOnce(
-        async (_md: string, container: any) => {
-          const pre = container.createEl('pre');
-          pre.createEl('code', { text: 'some code' });
-          const copyBtn = pre.createEl('button');
-          copyBtn.className = 'copy-code-button';
-        }
-      );
-
-      await renderer.renderContent(el, '```\nsome code\n```');
-
-      expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalled();
+        expect(removeOverlay).toHaveBeenCalledTimes(1);
+        expect(mockBody.createDiv).toHaveBeenCalledTimes(1);
+      } finally {
+        (globalThis as any).document = origDocument;
+      }
     });
   });
 

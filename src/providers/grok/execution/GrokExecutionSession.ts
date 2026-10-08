@@ -1,42 +1,44 @@
 import { randomUUID } from 'node:crypto';
 
-import type {
-  ChatRewindMode,
-  ChatRewindPreview,
-  ChatRewindResult,
-  ModeConfigurableExecutionSession,
-  ProviderExecutionEvent,
-  ProviderExecutionRequest,
-  ProviderExecutionRun,
-  ProviderExecutionSession,
-  ProviderRequestedEventScope,
-  ProviderSessionConfig,
-  ProviderSessionEvent,
-  ProviderSessionSnapshot,
-  ProviderSessionStatus,
-  RewindableExecutionSession,
-  SteerableExecutionSession,
-} from '../../../core/execution';
-import type { ProviderHost } from '../../../core/providers/ProviderHost';
-import type { ChatMessage } from '../../../core/types';
-import { appendBrowserContext } from '../../../utils/browser';
-import { appendCanvasContext } from '../../../utils/canvas';
-import { appendLinkedContent } from '../../../utils/context';
-import { appendEditorContext } from '../../../utils/editor';
+import { parseCompactCommand } from '@/core/commands/compactCommand';
 import {
   buildContextFromHistory,
   buildPromptWithHistoryContext,
-} from '../../../utils/session';
+} from '@/core/prompt/historyContext';
+import { appendLinkedContent, appendSelectionContexts, appendSessionReferences } from '@/core/prompt/promptContext';
+
 import {
-  type AcpContentBlock,
-  AcpExecutionEventNormalizer,
-  AcpInteractionController,
-  type AcpPromptResponse,
-  type AcpSessionConfigOption,
-  type AcpSessionModelState,
-  type AcpSessionNotification,
-  AcpToolStreamAdapter,
-  buildAcpUsageInfo,
+  type ChatRewindMode,
+  type ChatRewindPreview,
+  type ChatRewindResult,
+  type ProviderExecutionRequest,
+  type ProviderExecutionRun,
+  type ProviderExecutionSession,
+  type ProviderSessionConfig,
+  type ProviderSessionEvent,
+  type ProviderSessionInvalidation,
+  type ProviderSessionSnapshot,
+  type ProviderSessionStatus,
+  RequestedRunChannel,
+  type RewindableExecutionSession,
+  SessionSnapshotState,
+  type SteerableExecutionSession,
+} from '../../../core/execution';
+import { ProviderModelUnavailableError } from '../../../core/providers/models/ProviderModelUnavailableError';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
+import type { ChatMessage } from '../../../core/types';
+import {
+  type ACPContentBlock,
+  ACPInteractionController,
+  type ACPPromptResponse,
+  ACPRequestedTurn,
+  type ACPSessionConfigOption,
+  type ACPSessionModelState,
+  type ACPSessionNotification,
+  ACPToolStreamAdapter,
+  type ACPUsage,
+  buildACPUsageInfo,
+  mapACPApprovalDecision,
 } from '../../acp';
 import type { GrokCommandCatalog } from '../commands/GrokCommandCatalog';
 import { computeGrokEnvironmentHash } from '../env/GrokSettingsReconciler';
@@ -44,6 +46,7 @@ import {
   resolveGrokSessionCwd,
   resolveGrokSessionDirectory,
 } from '../history/GrokHistoryPathResolver';
+import { resolveGrokLiveMessageId } from '../history/GrokHistoryStore';
 import {
   decodeGrokModelId,
   findGrokModel,
@@ -51,17 +54,23 @@ import {
   type GrokDiscoveredModel,
   normalizeGrokDiscoveredModels,
 } from '../models';
+import { normalizeGrokCommands } from '../normalization/grokCommandNormalization';
 import {
-  normalizeGrokToolCall,
+  buildGrokToolProviderPayload,
+  normalizeGrokToolInput,
   normalizeGrokToolName,
-  normalizeGrokToolUseResult,
+  normalizeGrokToolResultDetails,
+  normalizeGrokToolUpdate,
   resolveGrokRawToolName,
 } from '../normalization/grokToolNormalization';
+import { parseGrokPromptUsage, parseGrokUsage } from '../normalization/grokUsage';
+import { shouldAutoApproveGrokPermission } from '../permissionModes';
 import {
   buildGrokSystemPrompt,
   type GrokSystemPromptSettings,
 } from '../prompt/GrokSystemPrompt';
 import { waitForGrokCancelDelivery } from '../runtime/GrokCancelDelivery';
+import { assertGrokModelAvailable } from '../runtime/GrokModelAvailability';
 import type { GrokModelCatalogCoordinator } from '../runtime/GrokModelCatalogCoordinator';
 import { buildGrokRuntimeEnv } from '../runtime/GrokRuntimeEnvironment';
 import { GrokSessionNotificationMirrorDeduplicator } from '../runtime/GrokSessionNotificationMirrorDeduplicator';
@@ -89,88 +98,28 @@ interface GrokExecutionSessionOptions {
   ) => Promise<number | null>;
 }
 
-class ExecutionEventQueue implements AsyncIterable<ProviderExecutionEvent> {
-  private closed = false;
-  private readonly items: ProviderExecutionEvent[] = [];
-  private readonly waiters: Array<(result: IteratorResult<ProviderExecutionEvent>) => void> = [];
-
-  constructor(private readonly onReturn: () => void) {}
-
-  push(event: ProviderExecutionEvent): void {
-    if (this.closed) return;
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ done: false, value: event });
-    else this.items.push(event);
-  }
-
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    while (this.waiters.length > 0) {
-      this.waiters.shift()?.({ done: true, value: undefined });
-    }
-  }
-
-  [Symbol.asyncIterator](): AsyncIterator<ProviderExecutionEvent> {
-    return {
-      next: async () => {
-        const item = this.items.shift();
-        if (item) return { done: false, value: item };
-        if (this.closed) return { done: true, value: undefined };
-        return new Promise(resolve => this.waiters.push(resolve));
-      },
-      return: async () => {
-        this.onReturn();
-        this.close();
-        return { done: true, value: undefined };
-      },
-    };
-  }
-}
-
-class GrokExecutionRunState implements ProviderExecutionRun {
-  readonly events: AsyncIterable<ProviderExecutionEvent>;
-  private readonly queue: ExecutionEventQueue;
-  private terminal = false;
-
-  constructor(
-    readonly executionId: string,
-    readonly turnId: string,
-    private readonly cancelCallback: () => void,
-  ) {
-    this.queue = new ExecutionEventQueue(cancelCallback);
-    this.events = this.queue;
-  }
-
-  cancel(): void {
-    this.cancelCallback();
-  }
-
-  emit(event: ProviderExecutionEvent): void {
-    if (!this.terminal) this.queue.push(event);
-  }
-
-  finish(event: ProviderExecutionEvent): void {
-    if (this.terminal) return;
-    this.terminal = true;
-    this.queue.push(event);
-    this.queue.close();
-  }
-
-  get isTerminal(): boolean {
-    return this.terminal;
-  }
+interface PendingInterjection {
+  accepted: boolean;
+  applied: boolean;
+  readonly text: string;
 }
 
 interface ActiveExecution {
-  acceptingLiveOutput: boolean;
   readonly abortController: AbortController;
-  accepted: boolean;
   readonly cancellationGeneration: number;
-  readonly normalizer: AcpExecutionEventNormalizer;
   readonly request: ProviderExecutionRequest;
-  readonly run: GrokExecutionRunState;
-  sequence: number;
+  readonly run: RequestedRunChannel;
+  readonly turn: ACPRequestedTurn;
+  promptUsage: ACPUsage | null;
+  promptResponse?: ACPPromptResponse;
+  readonly interjections: Map<string, PendingInterjection>;
+  observedTurnCompletions: number;
+  requiredTurnCompletions: number;
+}
+
+interface GrokNativeSession {
+  readonly native: GrokExecutionNativeConnection;
+  readonly sessionId: string;
 }
 
 interface GrokNativeOwner {
@@ -179,6 +128,7 @@ interface GrokNativeOwner {
   loadedSessionConfigurationKey: string | null;
   loadedSessionId: string | null;
   modeUnsubscribe: () => void;
+  interjectionUnsubscribe: () => void;
   readonly modelContextKey: string;
   modelsUnsubscribe: () => void;
   readonly native: GrokExecutionNativeConnection;
@@ -190,7 +140,6 @@ export class GrokExecutionSession
 implements
 ProviderExecutionSession,
 SteerableExecutionSession,
-ModeConfigurableExecutionSession,
 RewindableExecutionSession {
   readonly providerId = 'grok' as const;
   readonly sessionInstanceId = randomUUID();
@@ -205,17 +154,15 @@ RewindableExecutionSession {
   private nativeOwner: GrokNativeOwner | null = null;
   private nativeStartupFlight: Promise<GrokExecutionNativeConnection> | null = null;
   private quarantineGeneration = 0;
-  private readonly interactionController: AcpInteractionController;
+  private readonly interactionController: ACPInteractionController;
   private readonly interactionRouter: GrokExecutionInteractionRouter;
-  private readonly listeners = new Set<(event: ProviderSessionEvent) => void>();
   private readonly mirrorDeduplicator = new GrokSessionNotificationMirrorDeduplicator();
   private nativeConversationContextEstablished: boolean;
-  private readonly providerStateDeletes = new Set<string>();
   private providerSessionId: string | undefined;
-  private providerState: Readonly<Record<string, unknown>>;
+  private readonly state: SessionSnapshotState;
   private forkApplied = false;
-  private revision = 0;
-  private snapshot: ProviderSessionSnapshot;
+  private nativeAlwaysApproveOverride = false;
+  private selectedPermissionMode = 'normal';
 
   constructor(
     private readonly plugin: ProviderHost,
@@ -224,14 +171,18 @@ RewindableExecutionSession {
   ) {
     this.providerSessionId = config.resumeSeed?.providerSessionId;
     const providerState = parseGrokProviderState(config.resumeSeed?.providerState);
-    this.providerState = { ...providerState };
+    this.state = new SessionSnapshotState({
+      providerId: this.providerId,
+      providerState: { ...providerState },
+      readProviderSessionId: () => this.providerSessionId,
+      sessionInstanceId: this.sessionInstanceId,
+    });
     this.nativeConversationContextEstablished = Boolean(providerState.forkSource)
       || Boolean(
         this.providerSessionId
         && providerState.nativeConversationContextEstablished !== false,
       );
-    this.snapshot = this.createSnapshot('idle');
-    this.interactionController = new AcpInteractionController({
+    this.interactionController = new ACPInteractionController({
       getTurnId: () => this.active?.run.turnId ?? null,
       interactionPort: config.interactionPort,
       sessionInstanceId: this.sessionInstanceId,
@@ -245,64 +196,58 @@ RewindableExecutionSession {
   }
 
   execute(request: ProviderExecutionRequest): ProviderExecutionRun {
-    if (this.disposed) throw new Error('Grok execution session is disposed.');
-    if (this.active) throw new Error('Grok execution session is already executing.');
-    const run = new GrokExecutionRunState(
-      randomUUID(),
-      randomUUID(),
-      () => { void this.cancelRun(run, 'cancelled'); },
-    );
+    if (this.disposed) throw new Error('Grok Build execution session is disposed.');
+    if (this.active) throw new Error('Grok Build execution session is already executing.');
+    const run = new RequestedRunChannel({
+      onCancel: source => {
+        void this.#cancelRun(run, source === 'abort-signal' ? 'aborted' : 'cancelled');
+      },
+      sessionInstanceId: this.sessionInstanceId,
+    });
     const active: ActiveExecution = {
-      acceptingLiveOutput: false,
       abortController: new AbortController(),
-      accepted: false,
       cancellationGeneration: this.cancellationGeneration,
-      normalizer: new AcpExecutionEventNormalizer({
-        mapUsage: usage => buildAcpUsageInfo({ contextWindow: usage }),
-        scope: {
-          executionId: run.executionId,
-          kind: 'requested',
-          sessionInstanceId: this.sessionInstanceId,
-          turnId: run.turnId,
-        },
-        toolStreamAdapter: createGrokToolStreamAdapter(),
-      }),
+      promptUsage: null,
+      interjections: new Map(),
+      observedTurnCompletions: 0,
+      requiredTurnCompletions: 0,
       request,
       run,
-      sequence: 0,
+      turn: new ACPRequestedTurn({
+        acceptsSilentUpdates: true,
+        onAccept: () => {
+          if (this.nativeConversationContextEstablished) return;
+          this.#setNativeConversationContextEstablished(true);
+          this.#updateSnapshot('executing');
+          this.#emitCurrentSnapshot();
+        },
+        run,
+        toolStreamAdapter: createGrokToolStreamAdapter(),
+      }),
     };
     this.active = active;
-    this.updateSnapshot('executing');
-    this.emitCurrentSnapshot();
-    const onAbort = (): void => { void this.cancelRun(run, 'aborted'); };
-    request.signal.addEventListener('abort', onAbort, { once: true });
-    if (request.signal.aborted) {
-      request.signal.removeEventListener('abort', onAbort);
-      onAbort();
-    } else {
-      void this.performExecution(active).finally(() => {
-        request.signal.removeEventListener('abort', onAbort);
-      });
-    }
+    this.#updateSnapshot('executing');
+    this.#emitCurrentSnapshot();
+    run.attachAbortSignal(request.signal);
+    if (!run.isCancellationRequested) void this.#performExecution(active);
     return run;
   }
 
   cancel(): void {
     const run = this.active?.run;
-    if (run) void this.cancelRun(run, 'cancelled');
+    if (run) void this.#cancelRun(run, 'cancelled');
   }
 
   getSnapshot(): ProviderSessionSnapshot {
-    return this.snapshot;
+    return this.state.getSnapshot();
   }
 
   getStatus(): ProviderSessionStatus {
-    return this.snapshot.status;
+    return this.state.status;
   }
 
   onEvent(listener: (event: ProviderSessionEvent) => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    return this.state.onEvent(listener);
   }
 
   dispose(): Promise<void> {
@@ -311,52 +256,44 @@ RewindableExecutionSession {
     this.quarantineGeneration += 1;
     this.disposalFlight = (async () => {
       const active = this.active;
-      if (active) await this.cancelRun(active.run, 'session-disposed');
+      if (active) await this.#cancelRun(active.run, 'session-disposed');
       if (this.cancellationFlight) await this.cancellationFlight;
-      await this.shutdownNative();
+      await this.#shutdownNative();
       this.interactionController.dispose();
       this.interactionRouter.dismissAll('session-disposed');
-      this.listeners.clear();
-      this.updateSnapshot('disposed');
+      this.state.clearListeners();
+      this.#updateSnapshot('disposed');
     })();
     return this.disposalFlight;
   }
 
   async steer(request: ProviderExecutionRequest): Promise<boolean> {
+    try { assertGrokModelAvailable(this.plugin.settings, request.configuration.model); }
+    catch (error) { if (error instanceof ProviderModelUnavailableError) return false; throw error; }
     const active = this.active;
     const native = this.nativeOwner?.initialized ? this.nativeOwner.native : null;
     if (
       !active
-      || this.isCancellationRequested(active)
+      || this.#isCancellationRequested(active)
       || !native?.interject
       || !this.providerSessionId
       || request.signal.aborted
     ) return false;
     const blocks = buildPromptBlocks(request);
-    await native.interject({
-      content: blocks,
-      interjectionId: randomUUID(),
-      sessionId: this.providerSessionId,
-      text: blocks.filter(block => block.type === 'text')
-        .map(block => block.text)
-        .join('\n'),
-    }, request.signal);
-    return true;
-  }
-
-  async setMode(mode: string): Promise<boolean> {
-    if (this.disposed) return false;
-    if (mode !== 'plan' && mode !== 'default' && mode !== 'normal') return false;
+    const interjectionId = randomUUID();
+    const text = blocks.filter(block => block.type === 'text').map(block => block.text).join('\n');
+    const pending: PendingInterjection = { accepted: false, applied: false, text };
+    active.interjections.set(interjectionId, pending);
     try {
-      const native = await this.ensureNative();
-      const sessionId = await this.ensureSession(native, undefined);
-      const normalized = mode === 'plan' ? 'plan' : 'default';
-      await native.setMode({ modeId: normalized, sessionId });
-      this.updateSnapshot(this.active ? 'executing' : 'idle');
-      this.emitSessionMode(normalized);
+      await native.interject({ content: blocks, interjectionId, sessionId: this.providerSessionId, text }, request.signal);
+      pending.accepted = true;
+      if (pending.applied) active.interjections.delete(interjectionId);
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      active.interjections.delete(interjectionId);
+      throw error;
+    } finally {
+      this.#finishCompletedIfReady(active);
     }
   }
 
@@ -365,7 +302,7 @@ RewindableExecutionSession {
     assistantMessageId: string | undefined,
     mode: ChatRewindMode = 'conversation',
   ): Promise<ChatRewindPreview> {
-    return this.performRewind(assistantMessageId, mode, false);
+    return this.#performRewind(assistantMessageId, mode, false);
   }
 
   async rewind(
@@ -373,57 +310,72 @@ RewindableExecutionSession {
     assistantMessageId: string | undefined,
     mode: ChatRewindMode = 'conversation',
   ): Promise<ChatRewindResult> {
-    const result = await this.performRewind(assistantMessageId, mode, true);
+    const result = await this.#performRewind(assistantMessageId, mode, true);
     return {
       ...result,
       sessionStrategy: 'preserve-provider-session',
     };
   }
 
-  private async performExecution(active: ActiveExecution): Promise<void> {
+  async #performExecution(active: ActiveExecution): Promise<void> {
     if (active.request.toolPolicy.kind === 'allow-list') {
-      this.updateSnapshot('invalidated', {
-        message: 'Exact Grok tool allow-list enforcement is unavailable.',
+      this.#updateSnapshot('invalidated', {
+        message: 'Exact Grok Build tool allow-list enforcement is unavailable.',
         reason: 'configuration-changed',
         recoverable: false,
       });
-      this.emitCurrentSnapshot();
+      this.#emitCurrentSnapshot();
       active.run.finish({
         category: 'configuration',
-        message: 'Grok does not support reliable exact allow-list enforcement.',
+        message: 'Grok Build does not support reliable exact allow-list enforcement.',
         recoverable: false,
-        scope: this.nextScope(active),
         type: 'execution_error',
       });
-      active.normalizer.dispose();
+      active.turn.dispose();
       if (this.active === active) this.active = null;
       return;
     }
+    let unsubscribeClose: (() => void) | undefined;
     try {
+      assertGrokModelAvailable(this.plugin.settings, active.request.configuration.model);
       if (this.cancellationFlight) await this.cancellationFlight;
-      if (this.isCancellationRequested(active)) return;
-      const native = await this.ensureNative(active);
-      if (this.isCancellationRequested(active)) return;
-      const sessionId = await this.ensureSession(native, active.request, active);
-      if (this.isCancellationRequested(active)) return;
-      await this.applyConfiguration(native, sessionId, active.request, active);
-      if (this.isCancellationRequested(active)) return;
-      active.normalizer.reset();
-      active.acceptingLiveOutput = true;
-      const response = await native.prompt({
-        prompt: buildPromptBlocks(
-          active.request,
-          !this.nativeConversationContextEstablished,
-        ),
-        sessionId,
+      if (this.#isCancellationRequested(active)) return;
+      const { native, sessionId } = await this.#ensureSession(
+        await this.#ensureNative(active),
+        active.request,
+        active,
+      );
+      if (this.#isCancellationRequested(active)) return;
+      await this.#applyConfiguration(native, sessionId, active.request, active);
+      if (this.#isCancellationRequested(active)) return;
+      assertGrokModelAvailable(this.plugin.settings, active.request.configuration.model);
+      // Interjections are literal turn input; only requested prompts resolve native commands.
+      const compact = parseCompactCommand(getInputText(active.request));
+      if (compact && !this.nativeConversationContextEstablished && active.request.conversationHistory?.length) {
+        throw new Error('Send a normal message to restore the native conversation before using /compact.');
+      }
+      active.turn.beginLiveOutput();
+      const closed = new Promise<never>((_resolve, reject) => {
+        unsubscribeClose = native.onClose?.(error => {
+          reject(new Error('Grok Build transport closed', { cause: error }));
+        });
       });
-      if (this.isCancellationRequested(active)) return;
-      this.accept(active, response);
-      this.finishCompleted(active, response);
+      const response = await Promise.race([closed, native.prompt({
+        prompt: compact
+          ? [{ type: 'text', text: `/compact${compact.instructions ? ` ${compact.instructions}` : ''}` }]
+          : buildPromptBlocks(active.request, !this.nativeConversationContextEstablished),
+        sessionId,
+      })]);
+      if (this.#isCancellationRequested(active)) return;
+      active.turn.accept(response.userMessageId);
+      active.promptResponse = response;
+      active.promptUsage = parseGrokPromptUsage(response) ?? active.promptUsage;
+      this.#finishCompletedIfReady(active);
+      await Promise.race([closed, active.run.terminated]);
     } catch (error) {
-      if (this.isCancellationRequested(active)) return;
+      if (this.#isCancellationRequested(active)) return;
       const category = classifyError(error);
-      this.updateSnapshot('invalidated', {
+      this.#updateSnapshot('invalidated', {
         message: error instanceof Error ? error.message : String(error),
         reason: category === 'provider-session-missing'
           ? 'provider-session-missing'
@@ -432,7 +384,7 @@ RewindableExecutionSession {
             : 'provider-error',
         recoverable: true,
       });
-      this.emitCurrentSnapshot();
+      this.#emitCurrentSnapshot();
       active.run.finish({
         category,
         message: error instanceof Error ? error.message : String(error),
@@ -440,15 +392,16 @@ RewindableExecutionSession {
           ? { missingProviderSessionId: this.providerSessionId }
           : {}),
         recoverable: true,
-        scope: this.nextScope(active),
         type: 'execution_error',
       });
-      active.normalizer.dispose();
+      active.turn.dispose();
       this.active = null;
+    } finally {
+      unsubscribeClose?.();
     }
   }
 
-  private async ensureNative(
+  async #ensureNative(
     active?: ActiveExecution,
   ): Promise<GrokExecutionNativeConnection> {
     const currentOwner = this.nativeOwner;
@@ -459,7 +412,7 @@ RewindableExecutionSession {
     ) return currentOwner.native;
     let startupFlight = this.nativeStartupFlight;
     if (!startupFlight) {
-      startupFlight = this.startNative(this.quarantineGeneration);
+      startupFlight = this.#startNative(this.quarantineGeneration);
       this.nativeStartupFlight = startupFlight;
       startupFlight.then(
         () => {
@@ -471,21 +424,18 @@ RewindableExecutionSession {
       );
     }
     const native = await startupFlight;
-    this.throwIfCancellationRequested(active);
+    this.#throwIfCancellationRequested(active);
     return native;
   }
 
-  private async startNative(
+  async #startNative(
     quarantineGeneration: number,
   ): Promise<GrokExecutionNativeConnection> {
     const previousOwner = this.nativeOwner;
-    if (previousOwner) await this.shutdownNativeOwner(previousOwner);
-    const host = this.plugin as ProviderHost & {
-      getResolvedProviderCliPath?: ProviderHost['getResolvedProviderCliPath'];
-    };
-    const command = await host.getResolvedProviderCliPath?.('grok') ?? 'grok';
+    if (previousOwner) await this.#shutdownNativeOwner(previousOwner);
+    const command = await this.plugin.getResolvedProviderCliPath('grok') ?? 'grok';
     if (quarantineGeneration !== this.quarantineGeneration || this.disposed) {
-      throw new Error('Grok native startup was cancelled.');
+      throw new Error('Grok Build native startup was cancelled.');
     }
     const generation = ++this.nativeGeneration;
     const native = this.options.nativeFactory.create({
@@ -496,6 +446,17 @@ RewindableExecutionSession {
         const policy = this.active?.request.toolPolicy.kind;
         if (policy === 'passive' || policy === 'read-only') {
           return Promise.resolve({ outcome: { outcome: 'cancelled' } });
+        }
+        const active = this.active;
+        if (active && shouldAutoApproveGrokPermission(
+          active.request.configuration.permissionMode,
+          request.toolCall.kind,
+        )) {
+          return Promise.resolve(
+            signal?.aborted || this.#isCancellationRequested(active)
+              ? { outcome: { outcome: 'cancelled' } }
+              : mapACPApprovalDecision('allow', request.options),
+          );
         }
         return this.interactionController.requestPermission(
           request,
@@ -515,6 +476,7 @@ RewindableExecutionSession {
       loadedSessionConfigurationKey: null,
       loadedSessionId: null,
       modeUnsubscribe: () => {},
+      interjectionUnsubscribe: () => {},
       modelContextKey: computeGrokEnvironmentHash(this.plugin.settings),
       modelsUnsubscribe: () => {},
       native,
@@ -525,16 +487,21 @@ RewindableExecutionSession {
     try {
       this.mirrorDeduplicator.reset();
       owner.notificationUnsubscribe = native.onNotification((notification, source) => {
-        if (this.isCurrentNativeOwner(owner)) this.handleNotification(notification, source);
+        if (this.#isCurrentNativeOwner(owner)) this.handleNotification(notification, source);
       });
+      owner.interjectionUnsubscribe = native.onInterjection?.(notification => {
+        if (this.#isCurrentNativeOwner(owner)) this.#handleInterjection(notification);
+      }) ?? (() => {});
       owner.modeUnsubscribe = native.onModeChanged?.(mode => {
-        if (!this.isCurrentNativeOwner(owner)) return;
-        this.updateSnapshot(this.active ? 'executing' : 'idle');
-        this.emitSessionMode(mode);
+        if (!this.#isCurrentNativeOwner(owner)) return;
+        const permissionMode = this.#resolveNativeAlwaysApproveChange(mode === 'yolo');
+        if (!permissionMode) return;
+        this.#updateSnapshot(this.active ? 'executing' : 'idle');
+        this.#emitPermissionMode(permissionMode);
       }) ?? (() => {});
       owner.modelsUnsubscribe = native.onModelsChanged?.(models => {
-        if (!this.isCurrentNativeOwner(owner)) return;
-        void this.publishModelUpdate(owner, models).catch(() => {
+        if (!this.#isCurrentNativeOwner(owner)) return;
+        void this.#publishModelUpdate(owner, models).catch(() => {
           // Catalog synchronization is best-effort and cannot disrupt the session.
         });
       }) ?? (() => {});
@@ -542,15 +509,15 @@ RewindableExecutionSession {
       if (
         quarantineGeneration !== this.quarantineGeneration
         || this.disposed
-        || !this.isCurrentNativeOwner(owner)
+        || !this.#isCurrentNativeOwner(owner)
       ) {
-        throw new Error('Grok native startup was cancelled.');
+        throw new Error('Grok Build native startup was cancelled.');
       }
       owner.initialized = true;
       return native;
     } catch (error) {
       try {
-        await this.shutdownNativeOwner(owner);
+        await this.#shutdownNativeOwner(owner);
       } catch {
         // Startup cleanup cannot replace the error that initiated quarantine.
       }
@@ -558,14 +525,14 @@ RewindableExecutionSession {
     }
   }
 
-  private async ensureSession(
+  async #ensureSession(
     native: GrokExecutionNativeConnection,
     request: ProviderExecutionRequest | undefined,
     active?: ActiveExecution,
-  ): Promise<string> {
-    const owner = this.getNativeOwner(native);
+  ): Promise<GrokNativeSession> {
+    const owner = this.#getNativeOwner(native);
     const sessionConfigurationKey = request
-      ? this.buildSessionConfigurationKey(request)
+      ? this.#buildSessionConfigurationKey(request)
       : null;
     if (this.providerSessionId) {
       if (owner.loadedSessionId === this.providerSessionId) {
@@ -573,37 +540,40 @@ RewindableExecutionSession {
           request
           && owner.loadedSessionConfigurationKey !== sessionConfigurationKey
         ) {
-          await this.shutdownNative();
-          this.throwIfCancellationRequested(active);
-          const replacement = await this.ensureNative(active);
-          return this.ensureSession(replacement, request, active);
+          await this.#shutdownNative();
+          this.#throwIfCancellationRequested(active);
+          const replacement = await this.#ensureNative(active);
+          return this.#ensureSession(replacement, request, active);
         }
-        return this.providerSessionId;
+        return { native, sessionId: this.providerSessionId };
       }
       const targetSessionId = this.providerSessionId;
-      return this.loadProviderSession(
+      return {
         native,
-        targetSessionId,
-        request,
-        active,
-        sessionConfigurationKey,
-      );
+        sessionId: await this.#loadProviderSession(
+          native,
+          targetSessionId,
+          request,
+          active,
+          sessionConfigurationKey,
+        ),
+      };
     }
-    const state = parseGrokProviderState(this.providerState);
+    const state = parseGrokProviderState(this.state.providerState);
     if (state.forkSource && !this.forkApplied) {
       if (!native.fork || !state.forkSourceSessionDirectory) {
-        throw new Error('Grok fork metadata is incomplete.');
+        throw new Error('Grok Build fork metadata is incomplete.');
       }
       const targetPromptIndex = await this.options.resolvePromptIndex?.(
         state.forkSourceSessionDirectory,
         state.forkSource.sessionId,
         state.forkSource.resumeAt,
       );
-      this.throwIfCancellationRequested(active);
+      this.#throwIfCancellationRequested(active);
       if (targetPromptIndex === null || targetPromptIndex === undefined) {
-        throw new Error('The Grok fork checkpoint could not be located.');
+        throw new Error('The Grok Build fork checkpoint could not be located.');
       }
-      const sessionId = await this.createForkSession(
+      const sessionId = await this.#createForkSession(
         native,
         state.forkSource.sessionId,
         {
@@ -617,86 +587,88 @@ RewindableExecutionSession {
           targetPromptIndex,
         },
       );
-      this.throwIfCancellationRequested(active);
+      this.#throwIfCancellationRequested(active);
       if (this.disposed) throw new GrokExecutionCancellationError();
-      return this.loadProviderSession(
+      return {
         native,
-        sessionId,
-        request,
-        active,
-        sessionConfigurationKey,
-      );
+        sessionId: await this.#loadProviderSession(
+          native,
+          sessionId,
+          request,
+          active,
+          sessionConfigurationKey,
+        ),
+      };
     }
     const response = await native.newSession({
-      _meta: this.buildSessionMeta(request),
+      _meta: this.#buildSessionMeta(request),
       cwd: this.config.vaultWorkingDirectory,
       mcpServers: [],
     });
-    this.throwIfCancellationRequested(active);
-    this.captureProviderSession(response.sessionId, null);
-    this.setNativeConversationContextEstablished(false);
+    this.#throwIfCancellationRequested(active);
+    this.#captureProviderSession(response.sessionId, null);
+    this.#setNativeConversationContextEstablished(false);
     owner.loadedSessionId = response.sessionId;
     owner.loadedSessionConfigurationKey = sessionConfigurationKey;
-    this.updateSnapshot(this.active ? 'executing' : 'idle');
-    this.emitCurrentSnapshot();
-    await this.publishSessionModels(response, owner.modelContextKey);
-    this.throwIfCancellationRequested(active);
-    return response.sessionId;
+    this.#updateSnapshot(this.active ? 'executing' : 'idle');
+    this.#emitCurrentSnapshot();
+    await this.#publishSessionModels(response, owner.modelContextKey);
+    this.#throwIfCancellationRequested(active);
+    return { native, sessionId: response.sessionId };
   }
 
-  private async loadProviderSession(
+  async #loadProviderSession(
     native: GrokExecutionNativeConnection,
     targetSessionId: string,
     request: ProviderExecutionRequest | undefined,
     active: ActiveExecution | undefined,
     sessionConfigurationKey: string | null,
   ): Promise<string> {
-    const owner = this.getNativeOwner(native);
+    const owner = this.#getNativeOwner(native);
     const response = await native.loadSession({
-      _meta: this.buildSessionMeta(request),
+      _meta: this.#buildSessionMeta(request),
       cwd: this.config.vaultWorkingDirectory,
       mcpServers: [],
       sessionId: targetSessionId,
     });
-    this.throwIfCancellationRequested(active);
+    this.#throwIfCancellationRequested(active);
     const loadedSessionId = response.sessionId ?? targetSessionId;
-    this.captureProviderSession(
+    this.#captureProviderSession(
       loadedSessionId,
-      typeof this.providerState.sessionDirectory === 'string'
-        ? this.providerState.sessionDirectory
+      typeof this.state.providerState.sessionDirectory === 'string'
+        ? this.state.providerState.sessionDirectory
         : undefined,
     );
     owner.loadedSessionId = loadedSessionId;
     owner.loadedSessionConfigurationKey = sessionConfigurationKey;
-    this.updateSnapshot(this.active ? 'executing' : 'idle');
-    this.emitCurrentSnapshot();
-    await this.publishSessionModels(response, owner.modelContextKey);
-    this.throwIfCancellationRequested(active);
+    this.#updateSnapshot(this.active ? 'executing' : 'idle');
+    this.#emitCurrentSnapshot();
+    await this.#publishSessionModels(response, owner.modelContextKey);
+    this.#throwIfCancellationRequested(active);
     return loadedSessionId;
   }
 
-  private buildSessionMeta(
+  #buildSessionMeta(
     request: ProviderExecutionRequest | undefined,
   ): Record<string, unknown> {
     return buildSessionMeta(
       request,
       request?.configuration.systemInstructions.kind === 'provider-default'
-        ? buildGrokSystemPrompt(this.getSystemPromptSettings(), {
-            dynamicSections: request.configuration.systemInstructions.dynamicSections,
-          })
+        ? buildGrokSystemPrompt(this.#getSystemPromptSettings())
         : undefined,
     );
   }
 
-  private buildSessionConfigurationKey(request: ProviderExecutionRequest): string {
-    const meta = this.buildSessionMeta(request);
+  #buildSessionConfigurationKey(request: ProviderExecutionRequest): string {
+    const meta = this.#buildSessionMeta(request);
     return JSON.stringify({
+      autoMode: meta.autoMode === true,
       systemPromptOverride: meta.systemPromptOverride ?? null,
       yoloMode: meta.yoloMode === true,
     });
   }
 
-  private getSystemPromptSettings(): GrokSystemPromptSettings {
+  #getSystemPromptSettings(): GrokSystemPromptSettings {
     return {
       customPrompt: this.plugin.settings.systemPrompt,
       mediaFolder: this.plugin.settings.mediaFolder,
@@ -705,7 +677,7 @@ RewindableExecutionSession {
     };
   }
 
-  private async applyConfiguration(
+  async #applyConfiguration(
     native: GrokExecutionNativeConnection,
     sessionId: string,
     request: ProviderExecutionRequest,
@@ -717,9 +689,9 @@ RewindableExecutionSession {
     if (rawModel) {
       // The request can predate model discovery, so validate again after
       // ensureSession has published the live model catalog.
-      const reasoningEffort = this.resolveReasoningEffort(
+      const reasoningEffort = this.#resolveReasoningEffort(
         rawModel,
-        request.configuration.reasoning,
+        request.configuration.reasoning ?? undefined,
       );
       const response = await native.setModel({
         ...(reasoningEffort
@@ -728,150 +700,173 @@ RewindableExecutionSession {
         modelId: rawModel,
         sessionId,
       });
-      this.throwIfCancellationRequested(active);
+      this.#throwIfCancellationRequested(active);
       const model = normalizeGrokSetModelMetadata(rawModel, response._meta);
       if (model) {
-        await this.mergeModelMetadataBestEffort(
+        await this.#mergeModelMetadataBestEffort(
           [model],
           undefined,
-          this.getNativeOwner(native).modelContextKey,
+          this.#getNativeOwner(native).modelContextKey,
         );
-        this.throwIfCancellationRequested(active);
+        this.#throwIfCancellationRequested(active);
       }
     }
-    const requestedMode = resolveGrokNativeMode(request);
-    if (requestedMode) {
+    const permissionMode = request.configuration.permissionMode;
+    if (permissionMode !== undefined) {
+      this.selectedPermissionMode = permissionMode;
+      this.nativeAlwaysApproveOverride = false;
       await native.setMode({
-        modeId: requestedMode,
+        modeId: 'default',
         sessionId,
       });
-      this.throwIfCancellationRequested(active);
+      this.#throwIfCancellationRequested(active);
     }
   }
 
-  private resolveReasoningEffort(
+  #resolveReasoningEffort(
     rawModelId: string,
     requestedReasoning: string | undefined,
   ): string | null {
     const settings = getGrokProviderSettings(this.plugin.settings);
     const model = findGrokModel(settings.currentCatalog?.models ?? [], rawModelId);
-    if (model?.reasoningMetadataResolved !== true) return null;
     const advertisedValues = getGrokAvailableReasoningEfforts(model)
       .map(effort => effort.value);
     const requested = requestedReasoning?.trim() ?? '';
     if (!requested) return null;
     if (advertisedValues.includes(requested)) return requested;
 
-    const preferred = settings.preferredReasoningByModel[rawModelId]?.trim() ?? '';
-    return advertisedValues.includes(preferred) ? preferred : null;
+    throw new Error(`Grok Build model "${rawModelId}" does not support reasoning effort "${requested}".`);
   }
 
   private handleNotification(
-    notification: AcpSessionNotification,
+    notification: ACPSessionNotification,
     source: 'extension' | 'standard',
   ): void {
     const active = this.active;
     if (
       this.disposed
       || !active
-      || this.isCancellationRequested(active)
+      || this.#isCancellationRequested(active)
       || notification.sessionId !== this.providerSessionId
       || !this.mirrorDeduplicator.shouldProcess(notification, source)
     ) return;
-    if (isTurnCompleted(notification.update)) return;
-    const result = active.normalizer.normalize(notification.update);
-    if (result.metadata?.type === 'commands') {
-      this.options.commandCatalog?.setCommandSnapshot([...result.metadata.commands]);
+    if ((notification.update as unknown as { sessionUpdate?: string }).sessionUpdate === 'auto_compact_completed') {
+      if (active.turn.acceptingLiveOutput) {
+        active.turn.accept();
+        active.run.emit({ type: 'context_compacted' });
+      }
       return;
     }
-    if (result.metadata?.type === 'config_options') {
+    if (isTurnCompleted(notification.update)) {
+      if (active.turn.acceptingLiveOutput) {
+        active.promptUsage = parseGrokUsage((notification.update as unknown as { usage?: unknown }).usage)
+          ?? active.promptUsage;
+        active.observedTurnCompletions += 1;
+        this.#finishCompletedIfReady(active);
+      }
+      return;
+    }
+    let update = notification.update;
+    if (update.sessionUpdate === 'agent_message_chunk' || update.sessionUpdate === 'user_message_chunk') {
+      const role = update.sessionUpdate === 'agent_message_chunk' ? 'assistant' : 'user';
+      const messageId = resolveGrokLiveMessageId(update, role, notification._meta);
+      if (messageId) update = { ...update, messageId };
+    } else if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+      update = normalizeGrokToolUpdate(update);
+    }
+    // ACP session modes do not describe Grok's Safe/YOLO permissions, so
+    // current_mode metadata is ignored.
+    const metadata = active.turn.handleUpdate(update);
+    if (metadata?.type === 'commands' && update.sessionUpdate === 'available_commands_update') {
+      this.options.commandCatalog?.setCommandSnapshot(normalizeGrokCommands(update.availableCommands));
+    } else if (metadata?.type === 'config_options') {
       const owner = this.nativeOwner;
-      if (owner) void this.publishModelsFromConfig(result.metadata.configOptions, owner);
-      return;
+      if (owner) void this.#publishModelsFromConfig(metadata.configOptions, owner);
     }
-    if (result.metadata?.type === 'current_mode') {
-      this.emitSessionMode(result.metadata.currentModeId === 'plan' ? 'plan' : 'default');
-      return;
-    }
-    if (!active.acceptingLiveOutput) return;
-    this.accept(active);
-    for (const event of result.events) {
-      active.run.emit({
-        ...event,
-        scope: this.nextScope(active),
+  }
+
+  #handleInterjection(notification: { sessionId: string; interjectionId?: string }): void {
+    const active = this.active;
+    if (!active || this.#isCancellationRequested(active) || notification.sessionId !== this.providerSessionId) return;
+    const id = notification.interjectionId
+      ?? (active.interjections.size === 1 ? active.interjections.keys().next().value : undefined);
+    if (!id) return;
+    const pending = active.interjections.get(id);
+    if (!pending || pending.applied) return;
+    pending.applied = true;
+    active.requiredTurnCompletions = Math.max(active.requiredTurnCompletions, active.observedTurnCompletions + 1);
+    active.run.emit({ type: 'user_message_started', content: pending.text });
+    if (pending.accepted) active.interjections.delete(id);
+    this.#finishCompletedIfReady(active);
+  }
+
+  #finishCompletedIfReady(active: ActiveExecution): void {
+    if (this.#isCancellationRequested(active)
+      || !active.promptResponse
+      || active.interjections.size > 0
+      || active.observedTurnCompletions < active.requiredTurnCompletions) return;
+    const response = active.promptResponse;
+    if (active.promptUsage) {
+      const model = active.request.configuration.model ?? '';
+      const advertisedWindow = findGrokModel(
+        getGrokProviderSettings(this.plugin.settings).currentCatalog?.models ?? [], model,
+      )?.contextWindow;
+      const size = active.turn.contextUsage?.size || advertisedWindow;
+      const usage = buildACPUsageInfo({
+        model: decodeGrokModelId(model) ?? undefined,
+        contextWindow: size ? { size, used: active.promptUsage.totalTokens } : null,
+        promptUsage: active.promptUsage,
       });
+      if (usage) active.run.emit({ type: 'usage_updated', usage });
     }
-  }
-
-  private accept(active: ActiveExecution, response?: AcpPromptResponse): void {
-    if (active.accepted) return;
-    active.accepted = true;
-    if (!this.nativeConversationContextEstablished) {
-      this.setNativeConversationContextEstablished(true);
-      this.updateSnapshot('executing');
-      this.emitCurrentSnapshot();
-    }
-    active.run.emit({
-      accepted: true,
-      ...(response?.userMessageId ? { nativeUserMessageId: response.userMessageId } : {}),
-      scope: this.nextScope(active),
-      type: 'turn_started',
-    });
-  }
-
-  private finishCompleted(active: ActiveExecution, response: AcpPromptResponse): void {
-    this.updateSnapshot('idle');
-    this.emitCurrentSnapshot();
+    this.#updateSnapshot('idle');
+    this.#emitCurrentSnapshot();
     active.run.finish({
       providerPayload: response,
       reason: mapStopReason(response.stopReason),
-      scope: this.nextScope(active),
       type: 'turn_completed',
     });
-    active.normalizer.dispose();
+    active.turn.dispose();
     this.active = null;
   }
 
-  private async cancelRun(run: GrokExecutionRunState, reason: string): Promise<void> {
+  async #cancelRun(run: RequestedRunChannel, reason: string): Promise<void> {
     const active = this.active;
     if (!active || active.run !== run || run.isTerminal) return;
     if (this.cancellationFlight) return this.cancellationFlight;
     this.cancellationGeneration += 1;
-    this.updateSnapshot('cancelling');
-    this.emitCurrentSnapshot();
+    this.#updateSnapshot('cancelling');
+    this.#emitCurrentSnapshot();
     this.quarantineGeneration += 1;
     active.abortController.abort();
     this.interactionController.dismissAll('cancelled');
     this.interactionRouter.dismissAll('cancelled');
     const native = this.nativeOwner?.native ?? null;
     this.cancellationFlight = (async () => {
-      await this.joinForkCreation();
+      await this.#joinForkCreation();
       const sessionId = this.providerSessionId;
       if (native && sessionId) native.cancel(sessionId);
       try {
         await waitForGrokCancelDelivery(
           native?.flush ? { flush: () => native.flush!() } : undefined,
         );
-        await this.shutdownNative();
+        await this.#shutdownNative();
       } catch {
         // Teardown failure cannot replace the already-requested cancellation terminal.
       } finally {
         if (!this.disposed) {
-          this.updateSnapshot('invalidated', {
-            message: 'The cancelled Grok process was quarantined and will be replaced.',
+          this.#updateSnapshot('invalidated', {
+            message: 'The cancelled Grok Build process was quarantined and will be replaced.',
             reason: 'cancelled',
             recoverable: true,
           });
-          this.emitCurrentSnapshot();
+          this.#emitCurrentSnapshot();
         }
-        if (!run.isTerminal) {
-          run.finish({
-            reason,
-            scope: this.nextScope(active),
-            type: 'cancelled',
-          });
-        }
-        active.normalizer.dispose();
+        active.run.finish({
+          reason,
+          type: 'cancelled',
+        });
+        active.turn.dispose();
         if (this.active === active) this.active = null;
       }
     })().finally(() => {
@@ -880,27 +875,27 @@ RewindableExecutionSession {
     return this.cancellationFlight;
   }
 
-  private isCancellationRequested(active: ActiveExecution): boolean {
+  #isCancellationRequested(active: ActiveExecution): boolean {
     return this.disposed
       || active.cancellationGeneration !== this.cancellationGeneration
       || this.active !== active
       || active.run.isTerminal;
   }
 
-  private throwIfCancellationRequested(active: ActiveExecution | undefined): void {
-    if (active && this.isCancellationRequested(active)) {
+  #throwIfCancellationRequested(active: ActiveExecution | undefined): void {
+    if (active && this.#isCancellationRequested(active)) {
       throw new GrokExecutionCancellationError();
     }
   }
 
-  private async shutdownNative(): Promise<void> {
-    await this.joinForkCreation();
+  async #shutdownNative(): Promise<void> {
+    await this.#joinForkCreation();
     const startupFlight = this.nativeStartupFlight;
     const owner = this.nativeOwner;
     let shutdownError: Error | null = null;
     if (owner) {
       try {
-        await this.shutdownNativeOwner(owner);
+        await this.#shutdownNativeOwner(owner);
       } catch (error) {
         shutdownError = toError(error);
       }
@@ -915,7 +910,7 @@ RewindableExecutionSession {
     const remainingOwner = this.nativeOwner;
     if (remainingOwner) {
       try {
-        await this.shutdownNativeOwner(remainingOwner);
+        await this.#shutdownNativeOwner(remainingOwner);
       } catch (error) {
         shutdownError ??= toError(error);
       }
@@ -923,23 +918,23 @@ RewindableExecutionSession {
     if (shutdownError) throw shutdownError;
   }
 
-  private createForkSession(
+  #createForkSession(
     native: GrokExecutionNativeConnection,
     sourceSessionId: string,
     request: Parameters<NonNullable<GrokExecutionNativeConnection['fork']>>[0],
   ): Promise<string> {
     if (this.forkCreationFlight) return this.forkCreationFlight;
     const fork = native.fork?.bind(native);
-    if (!fork) return Promise.reject(new Error('Grok fork metadata is incomplete.'));
+    if (!fork) return Promise.reject(new Error('Grok Build fork metadata is incomplete.'));
 
     const flight = (async () => {
       const response = await fork(request);
       if (!response.newSessionId.trim()) {
-        throw new Error('Grok returned a fork without a child session.');
+        throw new Error('Grok Build returned a fork without a child session.');
       }
-      this.adoptForkSession(response.newSessionId);
+      this.#adoptForkSession(response.newSessionId);
       if (response.parentSessionId !== sourceSessionId) {
-        throw new Error('Grok returned a fork for an unexpected parent session.');
+        throw new Error('Grok Build returned a fork for an unexpected parent session.');
       }
       return response.newSessionId;
     })();
@@ -955,20 +950,16 @@ RewindableExecutionSession {
     return flight;
   }
 
-  private adoptForkSession(providerSessionId: string): void {
+  #adoptForkSession(providerSessionId: string): void {
     this.forkApplied = true;
-    const remainingProviderState = { ...this.providerState };
-    delete remainingProviderState.forkSource;
-    delete remainingProviderState.forkSourceSessionDirectory;
-    this.providerState = remainingProviderState;
-    this.providerStateDeletes.add('forkSource');
-    this.providerStateDeletes.add('forkSourceSessionDirectory');
-    this.captureProviderSession(providerSessionId, null);
-    this.updateSnapshot(this.active ? 'executing' : 'idle');
-    this.emitCurrentSnapshot();
+    this.state.deleteProviderStateValue('forkSource');
+    this.state.deleteProviderStateValue('forkSourceSessionDirectory');
+    this.#captureProviderSession(providerSessionId, null);
+    this.#updateSnapshot(this.active ? 'executing' : 'idle');
+    this.#emitCurrentSnapshot();
   }
 
-  private async joinForkCreation(): Promise<void> {
+  async #joinForkCreation(): Promise<void> {
     const flight = this.forkCreationFlight;
     if (!flight) return;
     try {
@@ -978,7 +969,7 @@ RewindableExecutionSession {
     }
   }
 
-  private shutdownNativeOwner(owner: GrokNativeOwner): Promise<void> {
+  #shutdownNativeOwner(owner: GrokNativeOwner): Promise<void> {
     if (this.nativeOwner === owner) {
       this.nativeOwner = null;
       try {
@@ -988,6 +979,7 @@ RewindableExecutionSession {
       }
       try {
         owner.modeUnsubscribe();
+        owner.interjectionUnsubscribe();
       } catch {
         // Listener cleanup cannot prevent process shutdown.
       }
@@ -1003,33 +995,33 @@ RewindableExecutionSession {
     return owner.shutdownFlight;
   }
 
-  private isCurrentNativeOwner(owner: GrokNativeOwner): boolean {
+  #isCurrentNativeOwner(owner: GrokNativeOwner): boolean {
     return !this.disposed
       && owner.generation === this.nativeGeneration
       && this.nativeOwner === owner;
   }
 
-  private getNativeOwner(
+  #getNativeOwner(
     native: GrokExecutionNativeConnection,
   ): GrokNativeOwner {
     const owner = this.nativeOwner;
     if (!owner || owner.native !== native) {
-      throw new Error('Grok native connection ownership changed.');
+      throw new Error('Grok Build native connection ownership changed.');
     }
     return owner;
   }
 
-  private async performRewind(
+  async #performRewind(
     assistantMessageId: string | undefined,
     mode: ChatRewindMode,
     force: boolean,
   ): Promise<ChatRewindPreview> {
-    const state = parseGrokProviderState(this.providerState);
+    const state = parseGrokProviderState(this.state.providerState);
     if (!this.providerSessionId || !assistantMessageId || !state.sessionDirectory) {
-      return { canRewind: false, error: 'Grok rewind metadata is unavailable.' };
+      return { canRewind: false, error: 'Grok Build rewind metadata is unavailable.' };
     }
     if (!this.options.resolvePromptIndex) {
-      return { canRewind: false, error: 'Grok prompt index resolution is unavailable.' };
+      return { canRewind: false, error: 'Grok Build prompt index resolution is unavailable.' };
     }
     const promptIndex = await this.options.resolvePromptIndex(
       state.sessionDirectory,
@@ -1037,11 +1029,10 @@ RewindableExecutionSession {
       assistantMessageId,
     );
     if (promptIndex === null) {
-      return { canRewind: false, error: 'The Grok prompt could not be located.' };
+      return { canRewind: false, error: 'The Grok Build prompt could not be located.' };
     }
-    const native = await this.ensureNative();
-    await this.ensureSession(native, undefined);
-    if (!native.rewind) return { canRewind: false, error: 'Grok rewind is unavailable.' };
+    const { native } = await this.#ensureSession(await this.#ensureNative(), undefined);
+    if (!native.rewind) return { canRewind: false, error: 'Grok Build rewind is unavailable.' };
     const response = await native.rewind({
       force,
       mode: mode === 'code-and-conversation' ? 'all' : 'conversation_only',
@@ -1056,7 +1047,7 @@ RewindableExecutionSession {
     };
   }
 
-  private captureProviderSession(
+  #captureProviderSession(
     providerSessionId: string,
     persistedSessionDirectory: string | null | undefined,
   ): void {
@@ -1073,22 +1064,16 @@ RewindableExecutionSession {
       },
     );
     if (sessionDirectory) {
-      this.providerState = {
-        ...this.providerState,
-        sessionDirectory,
-      };
+      this.state.setProviderStateValue('sessionDirectory', sessionDirectory);
     }
   }
 
-  private setNativeConversationContextEstablished(established: boolean): void {
+  #setNativeConversationContextEstablished(established: boolean): void {
     this.nativeConversationContextEstablished = established;
-    this.providerState = {
-      ...this.providerState,
-      nativeConversationContextEstablished: established,
-    };
+    this.state.setProviderStateValue('nativeConversationContextEstablished', established);
   }
 
-  private async publishSessionModels(
+  async #publishSessionModels(
     response: Pick<
       Awaited<ReturnType<GrokExecutionNativeConnection['newSession']>>,
       '_meta' | 'configOptions' | 'models'
@@ -1097,7 +1082,7 @@ RewindableExecutionSession {
   ): Promise<void> {
     const { currentModelId, models } = normalizeGrokSessionModelMetadata(response);
     if (models.length > 0) {
-      await this.mergeModelMetadataBestEffort(
+      await this.#mergeModelMetadataBestEffort(
         models,
         currentModelId ?? undefined,
         sourceContextKey,
@@ -1105,25 +1090,25 @@ RewindableExecutionSession {
     }
   }
 
-  private async publishModelUpdate(
+  async #publishModelUpdate(
     owner: GrokNativeOwner,
-    state: AcpSessionModelState,
+    state: ACPSessionModelState,
   ): Promise<void> {
-    if (!this.isCurrentNativeOwner(owner)) return;
+    if (!this.#isCurrentNativeOwner(owner)) return;
     const update = normalizeGrokModelUpdateMetadata(state);
-    if (!update || !this.isCurrentNativeOwner(owner)) return;
-    await this.mergeModelMetadataBestEffort(
+    if (!update || !this.#isCurrentNativeOwner(owner)) return;
+    await this.#mergeModelMetadataBestEffort(
       update.models,
       update.currentModelId ?? undefined,
       owner.modelContextKey,
     );
   }
 
-  private async publishModelsFromConfig(
-    options: readonly AcpSessionConfigOption[],
+  async #publishModelsFromConfig(
+    options: readonly ACPSessionConfigOption[],
     owner: GrokNativeOwner,
   ): Promise<void> {
-    if (!this.isCurrentNativeOwner(owner)) return;
+    if (!this.#isCurrentNativeOwner(owner)) return;
     const modelOption = options.find(option => option.id === 'model' && option.type === 'select');
     if (!modelOption || modelOption.type !== 'select') return;
     const flat = modelOption.options.flatMap(option => (
@@ -1136,7 +1121,7 @@ RewindableExecutionSession {
       supportsReasoning: false,
     })));
     if (models.length > 0) {
-      await this.mergeModelMetadataBestEffort(
+      await this.#mergeModelMetadataBestEffort(
         models,
         modelOption.currentValue,
         owner.modelContextKey,
@@ -1144,7 +1129,7 @@ RewindableExecutionSession {
     }
   }
 
-  private async mergeModelMetadataBestEffort(
+  async #mergeModelMetadataBestEffort(
     models: GrokDiscoveredModel[],
     defaultModelId: string | undefined,
     sourceContextKey: string,
@@ -1160,113 +1145,73 @@ RewindableExecutionSession {
     }
   }
 
-  private nextScope(active: ActiveExecution): ProviderRequestedEventScope {
-    return {
-      executionId: active.run.executionId,
-      kind: 'requested',
-      sequence: ++active.sequence,
-      sessionInstanceId: this.sessionInstanceId,
-      turnId: active.run.turnId,
-    };
-  }
-
-  private updateSnapshot(
+  #updateSnapshot(
     status: ProviderSessionStatus,
-    invalidation?: Extract<ProviderSessionSnapshot, { status: 'invalidated' }>['invalidation'],
+    invalidation?: ProviderSessionInvalidation,
   ): void {
-    this.snapshot = this.createSnapshot(status, invalidation);
+    if (status === 'invalidated') this.state.invalidate(invalidation!);
+    else this.state.setStatus(status);
   }
 
-  private createSnapshot(
-    status: ProviderSessionStatus,
-    invalidation?: Extract<ProviderSessionSnapshot, { status: 'invalidated' }>['invalidation'],
-  ): ProviderSessionSnapshot {
-    const providerState = this.providerState;
-    const base = {
-      ...(this.providerSessionId ? { providerSessionId: this.providerSessionId } : {}),
-      ...(Object.keys(providerState).length > 0 ? { providerState } : {}),
-      ...(this.providerStateDeletes.size > 0
-        ? { providerStateDeletes: [...this.providerStateDeletes] }
-        : {}),
-      providerId: this.providerId,
-      revision: this.revision++,
-    };
-    return status === 'invalidated'
-      ? { ...base, invalidation: invalidation!, status }
-      : { ...base, status };
-  }
-
-  private emitCurrentSnapshot(): void {
+  #emitCurrentSnapshot(): void {
     const active = this.active;
+    const event = {
+      snapshot: this.state.getSnapshot(),
+      type: 'session_state_changed' as const,
+    };
     if (active && !active.run.isTerminal) {
-      active.run.emit({
-        scope: this.nextScope(active),
-        snapshot: this.snapshot,
-        type: 'session_state_changed',
-      });
+      active.run.emit(event);
       return;
     }
-    const event: ProviderSessionEvent = {
-      scope: {
-        kind: 'session',
-        sequence: this.snapshot.revision,
-        sessionInstanceId: this.sessionInstanceId,
-      },
-      snapshot: this.snapshot,
-      type: 'session_state_changed',
-    };
-    for (const listener of this.listeners) {
-      try {
-        listener(event);
-      } catch {
-        // Session listeners cannot interfere with native Grok lifecycle.
-      }
-    }
+    this.state.emit(event);
   }
 
-  private emitSessionMode(mode: string): void {
-    const event: ProviderSessionEvent = {
-      mode,
-      scope: {
-        kind: 'session',
-        sequence: this.revision,
-        sessionInstanceId: this.sessionInstanceId,
-      },
-      snapshot: this.snapshot,
-      type: 'mode_changed',
-    };
-    for (const listener of this.listeners) {
-      try {
-        listener(event);
-      } catch {
-        // Session listeners cannot interfere with native Grok lifecycle.
-      }
+  /**
+   * Grok reports only always-approve toggles. Turning it off restores the mode
+   * selected before Grok turned it on, or Ask when always-approve was selected.
+   */
+  #resolveNativeAlwaysApproveChange(alwaysApprove: boolean): string | null {
+    const selected = this.selectedPermissionMode;
+    if (alwaysApprove) {
+      this.nativeAlwaysApproveOverride = selected !== 'yolo';
+      return 'yolo';
     }
+    if (this.nativeAlwaysApproveOverride) {
+      this.nativeAlwaysApproveOverride = false;
+      return selected;
+    }
+    return selected === 'yolo' ? 'normal' : null;
+  }
+
+  #emitPermissionMode(permissionMode: string): void {
+    this.state.emit({
+      permissionMode,
+      snapshot: this.state.getSnapshot(),
+      type: 'permission_mode_changed',
+    });
   }
 }
 
 class GrokExecutionCancellationError extends Error {
   constructor() {
-    super('Grok execution was cancelled.');
+    super('Grok Build execution was cancelled.');
     this.name = 'GrokExecutionCancellationError';
   }
 }
 
-function createGrokToolStreamAdapter(): AcpToolStreamAdapter {
-  return new AcpToolStreamAdapter({
-    normalizeToolInput(rawName, input) {
-      return normalizeGrokToolCall({ rawInput: input, title: rawName }).input;
+function createGrokToolStreamAdapter(): ACPToolStreamAdapter {
+  return new ACPToolStreamAdapter({
+    normalizeToolInput(rawName, input, rawOutput) {
+      return normalizeGrokToolInput(rawName ?? 'tool', input, rawOutput);
     },
-    normalizeToolName(rawName) {
-      return normalizeGrokToolName(rawName ?? 'tool');
+    normalizeToolName(rawName, rawInput, rawOutput) {
+      return normalizeGrokToolName(rawName ?? 'tool', rawInput, rawOutput);
     },
-    normalizeToolUseResult(rawName, _input, rawOutput, rawInput) {
-      return normalizeGrokToolUseResult(
-        rawName ?? 'tool',
-        _input,
-        rawOutput,
-        rawInput,
-      );
+    normalizeToolResultDetails(rawName, input, rawOutput) {
+      return normalizeGrokToolResultDetails(rawName ?? 'tool', input, rawOutput);
+    },
+    buildToolProviderPayload(rawName, rawInput, rawOutput) {
+      return buildGrokToolProviderPayload({ rawInput, rawName: rawName ?? 'tool', rawOutput });
     },
     resolveRawToolName(currentRawName, update) {
       return resolveGrokRawToolName(currentRawName, update);
@@ -1274,24 +1219,25 @@ function createGrokToolStreamAdapter(): AcpToolStreamAdapter {
   });
 }
 
-function buildPromptBlocks(
-  request: ProviderExecutionRequest,
-  replayConversationHistory = false,
-): AcpContentBlock[] {
-  const blocks: AcpContentBlock[] = [];
-  let text = request.input
+function getInputText(request: ProviderExecutionRequest): string {
+  return request.input
     .filter(block => block.type === 'text')
     .map(block => block.text)
     .join('\n');
+}
+
+function buildPromptBlocks(
+  request: ProviderExecutionRequest,
+  replayConversationHistory = false,
+): ACPContentBlock[] {
+  const blocks: ACPContentBlock[] = [];
+  let text = getInputText(request);
   const context = request.context;
   if (context?.linkedContent) {
     text = appendLinkedContent(text, context.linkedContent.path);
   }
-  if (context?.editorSelection && context.editorSelection.mode !== 'none') {
-    text = appendEditorContext(text, context.editorSelection);
-  }
-  if (context?.browserSelection) text = appendBrowserContext(text, context.browserSelection);
-  if (context?.canvasSelection) text = appendCanvasContext(text, context.canvasSelection);
+  text = appendSelectionContexts(text, context);
+  text = appendSessionReferences(text, context?.sessionReferences);
   if (replayConversationHistory && request.conversationHistory?.length) {
     const history = [...request.conversationHistory] as ChatMessage[];
     text = buildPromptWithHistoryContext(
@@ -1329,8 +1275,18 @@ function buildSessionMeta(
   return {
     ...(rawModel ? { modelId: rawModel } : {}),
     ...(systemPromptOverride ? { systemPromptOverride } : {}),
-    yoloMode: request.configuration.permissionMode === 'yolo'
-      || request.toolPolicy.kind === 'unrestricted',
+    ...resolveGrokPermissionMeta(request),
+  };
+}
+
+function resolveGrokPermissionMeta(
+  request: ProviderExecutionRequest,
+): { autoMode: boolean; yoloMode: boolean } {
+  const yoloMode = request.configuration.permissionMode === 'yolo'
+    || request.toolPolicy.kind === 'unrestricted';
+  return {
+    autoMode: !yoloMode && request.configuration.permissionMode === 'auto',
+    yoloMode,
   };
 }
 
@@ -1354,21 +1310,6 @@ function buildGrokSystemPromptOverride(
     .join('\n\n');
 }
 
-function resolveGrokNativeMode(
-  request: ProviderExecutionRequest,
-): 'default' | 'plan' | null {
-  const explicitMode = request.configuration.mode;
-  if (explicitMode !== undefined) {
-    if (explicitMode === 'plan') return 'plan';
-    if (explicitMode === 'default' || explicitMode === 'normal') return 'default';
-    return null;
-  }
-  const permissionMode = request.configuration.permissionMode;
-  if (permissionMode === 'plan') return 'plan';
-  if (permissionMode === 'normal' || permissionMode === 'yolo') return 'default';
-  return null;
-}
-
 function isTurnCompleted(update: unknown): boolean {
   return Boolean(
     update
@@ -1389,6 +1330,7 @@ function classifyError(
   error: unknown,
 ): 'authentication' | 'configuration' | 'provider-session-missing' | 'transport' | 'unknown' {
   const message = error instanceof Error ? error.message.toLowerCase() : '';
+  if (error instanceof ProviderModelUnavailableError) return 'configuration';
   if (message.includes('auth')) return 'authentication';
   if (message.includes('session') && (message.includes('missing') || message.includes('not found'))) {
     return 'provider-session-missing';

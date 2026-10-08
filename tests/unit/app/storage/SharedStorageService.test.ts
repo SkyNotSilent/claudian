@@ -1,18 +1,8 @@
+import { DEFAULT_CLAUDIAN_SETTINGS } from '@test/helpers/defaultSettings';
+
 import { SharedStorageService } from '@/app/storage/SharedStorageService';
-import type { SharedAppStorage } from '@/core/bootstrap/storage';
 
 describe('SharedStorageService', () => {
-  it('exposes only read-only session capabilities through SharedAppStorage', () => {
-    const writerIsExposed: 'saveMetadata' extends keyof SharedAppStorage['sessions']
-      ? true
-      : false = false;
-    const ledgerWriterIsExposed: 'saveInputLedger' extends keyof SharedAppStorage['sessions']
-      ? true
-      : false = false;
-
-    expect(writerIsExposed).toBe(false);
-    expect(ledgerWriterIsExposed).toBe(false);
-  });
 
   it('does not create storage directories during read-only initialization', async () => {
     const adapter = {
@@ -24,7 +14,7 @@ describe('SharedStorageService', () => {
     const plugin = {
       app: { vault: { adapter } },
     } as any;
-    const storage = new SharedStorageService(plugin);
+    const storage = new SharedStorageService(plugin, DEFAULT_CLAUDIAN_SETTINGS);
 
     await storage.initialize();
 
@@ -41,7 +31,7 @@ describe('SharedStorageService', () => {
       }),
       saveData: jest.fn().mockRejectedValue(error),
     } as any;
-    const storage = new SharedStorageService(plugin);
+    const storage = new SharedStorageService(plugin, DEFAULT_CLAUDIAN_SETTINGS);
 
     await expect(storage.clearTabManagerState()).rejects.toBe(error);
   });
@@ -58,7 +48,7 @@ describe('SharedStorageService', () => {
       }),
       saveData: jest.fn().mockResolvedValue(undefined),
     } as any;
-    const storage = new SharedStorageService(plugin);
+    const storage = new SharedStorageService(plugin, DEFAULT_CLAUDIAN_SETTINGS);
 
     await storage.clearTabManagerState();
 

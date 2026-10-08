@@ -6,7 +6,7 @@ function slashCommandToEntry(command: SlashCommand): ProviderCommandEntry {
   return {
     id: command.id,
     providerId: 'opencode',
-    kind: 'command',
+    kind: command.kind ?? 'command',
     name: command.name,
     description: command.description,
     content: command.content,
@@ -28,11 +28,24 @@ function slashCommandToEntry(command: SlashCommand): ProviderCommandEntry {
 }
 
 export class OpencodeCommandCatalog extends RuntimeCommandCatalog {
+  private nativeVersion: 1 | 2 | undefined;
+
+  setNativeVersion(version: 1 | 2 | undefined): void { this.nativeVersion = version; }
+
+  override getDropdownConfig() {
+    // A picker can be assembled before passive version detection finishes.
+    const config = super.getDropdownConfig();
+    Object.defineProperty(config, 'refreshOnOpen', { enumerable: true, get: () => this.nativeVersion === 2 || undefined });
+    return config;
+  }
+
   constructor() {
     super({
       dropdownConfig: {
         builtInPrefix: '/',
         commandPrefix: '/',
+        // Discovery chains internal step bounds with fallbacks.
+        discoveryTimeoutMs: 'provider-owned',
         providerId: 'opencode',
         skillPrefix: '/',
         triggerChars: ['/'],

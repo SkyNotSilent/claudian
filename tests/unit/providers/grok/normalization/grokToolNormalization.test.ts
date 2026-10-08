@@ -1,11 +1,16 @@
 import {
   normalizeGrokToolCall,
   normalizeGrokToolName,
-  normalizeGrokToolUseResult,
+  normalizeGrokToolResultDetails,
   resolveGrokRawToolName,
 } from '@/providers/grok/normalization/grokToolNormalization';
 
 describe('grokToolNormalization', () => {
+  it('keeps unknown tool results printable when they contain a circular record', () => {
+    const output: Record<string, unknown> = {};
+    output.self = output;
+    expect(normalizeGrokToolCall({ title: 'unknown_tool', rawInput: {}, rawOutput: output }).output).toBe('[Unserializable value]');
+  });
   it.each([
     ['run_terminal_command', 'Bash'],
     ['get_terminal_command_output', 'BashOutput'],
@@ -47,14 +52,6 @@ describe('grokToolNormalization', () => {
       expect(normalizeGrokToolName(rawName)).toBe(rawName);
     },
   );
-
-  it.each([
-    'spawn_subagent',
-    'get_command_or_subagent_output',
-    'kill_command_or_subagent',
-  ])('keeps observed dynamic task title %s ordinary and lossless', (rawName) => {
-    expect(normalizeGrokToolName(rawName)).toBe(rawName);
-  });
 
   it('preserves unknown names and raw input/output losslessly', () => {
     const rawInput = { nested: { flag: true }, value: 7 };
@@ -178,27 +175,20 @@ describe('grokToolNormalization', () => {
       type: 'UserAnswered',
     };
 
-    expect(normalizeGrokToolUseResult(
+    expect(normalizeGrokToolResultDetails(
       'ask_user_question',
       input,
       rawOutput,
-      input,
     )).toEqual({
-      answers: { 'How should we continue?': 'Use the durable implementation.' },
-      providerPayload: {
-        rawInput: input,
-        rawName: 'ask_user_question',
-        rawOutput,
-      },
+      resolvedAnswers: { 'How should we continue?': 'Use the durable implementation.' },
     });
 
     const jsonAnswer = '{"preference":"keep this as the answer"}';
-    expect(normalizeGrokToolUseResult(
+    expect(normalizeGrokToolResultDetails(
       'ask_user_question',
       input,
       { UserAnswered: { message: jsonAnswer } },
-      input,
-    ).answers).toEqual({
+    )?.resolvedAnswers).toEqual({
       'How should we continue?': jsonAnswer,
     });
   });

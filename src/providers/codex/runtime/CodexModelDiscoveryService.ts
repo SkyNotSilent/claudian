@@ -5,13 +5,8 @@ import {
   normalizeCodexDiscoveredModels,
 } from '../models';
 import { getCodexProviderSettings } from '../settings';
-import { CodexAppServerProcess } from './CodexAppServerProcess';
-import {
-  initializeCodexAppServerTransport,
-  resolveCodexAppServerLaunchSpec,
-} from './codexAppServerSupport';
+import type { CodexAppServerLease, CodexAppServerRuntime } from './CodexAppServerRuntime';
 import type { ModelListResult } from './codexAppServerTypes';
-import { CodexRpcTransport } from './CodexRpcTransport';
 
 export type CodexModelDiscoveryResult =
   | {
@@ -34,7 +29,7 @@ export interface CodexModelDiscoveryServiceLike {
 const MODEL_LIST_PAGE_SIZE = 100;
 
 export class CodexModelDiscoveryService implements CodexModelDiscoveryServiceLike {
-  constructor(private readonly plugin: ProviderHost) {}
+  constructor(private readonly plugin: ProviderHost, private readonly runtime: CodexAppServerRuntime) {}
 
   async discoverModels(
     signal?: AbortSignal,
@@ -47,50 +42,16 @@ export class CodexModelDiscoveryService implements CodexModelDiscoveryServiceLik
     if (signal?.aborted) {
       return {
         kind: 'completed',
-        diagnostics: 'Codex model discovery was cancelled',
+        diagnostics: 'Codex CLI model discovery was cancelled',
         models: [],
       };
     }
 
-    let process: CodexAppServerProcess | null = null;
-    let transport: CodexRpcTransport | null = null;
-    let abortListener: (() => void) | null = null;
+    let lease: CodexAppServerLease | null = null;
 
     try {
-      const launchSpec = await resolveCodexAppServerLaunchSpec(
-        this.plugin,
-        'codex',
-        context,
-      );
-      if (signal?.aborted) {
-        return {
-          kind: 'completed',
-          diagnostics: 'Codex model discovery was cancelled',
-          models: [],
-        };
-      }
-      process = new CodexAppServerProcess(launchSpec);
-      process.start();
-      transport = new CodexRpcTransport(process);
-      transport.start();
-
-      abortListener = () => {
-        transport?.dispose();
-        if (process) {
-          void process.shutdown().catch(() => {});
-        }
-      };
-      signal?.addEventListener('abort', abortListener, { once: true });
-
-      await initializeCodexAppServerTransport(transport);
-
-      if (signal?.aborted) {
-        return {
-          kind: 'completed',
-          diagnostics: 'Codex model discovery was cancelled',
-          models: [],
-        };
-      }
+      lease = await this.runtime.acquire({ readiness: 'initialized', signal, context });
+      const { transport } = lease.connection;
 
       const entries: unknown[] = [];
       const seenCursors = new Set<string>();
@@ -100,14 +61,14 @@ export class CodexModelDiscoveryService implements CodexModelDiscoveryServiceLik
           ...(cursor ? { cursor } : {}),
           includeHidden: false,
           limit: MODEL_LIST_PAGE_SIZE,
-        });
+        }, undefined, signal);
         entries.push(...result.data);
 
         const nextCursor: string | null = typeof result.nextCursor === 'string' && result.nextCursor.trim()
           ? result.nextCursor
           : null;
         if (nextCursor && seenCursors.has(nextCursor)) {
-          throw new Error('Codex model/list returned a repeated cursor');
+          throw new Error('Codex CLI model/list returned a repeated cursor');
         }
         if (nextCursor) {
           seenCursors.add(nextCursor);
@@ -117,7 +78,7 @@ export class CodexModelDiscoveryService implements CodexModelDiscoveryServiceLik
         if (signal?.aborted) {
           return {
             kind: 'completed',
-            diagnostics: 'Codex model discovery was cancelled',
+            diagnostics: 'Codex CLI model discovery was cancelled',
             models: [],
           };
         }
@@ -131,25 +92,19 @@ export class CodexModelDiscoveryService implements CodexModelDiscoveryServiceLik
       if (signal?.aborted) {
         return {
           kind: 'completed',
-          diagnostics: 'Codex model discovery was cancelled',
+          diagnostics: 'Codex CLI model discovery was cancelled',
           models: [],
         };
       }
-      const message = error instanceof Error ? error.message : 'Codex model discovery failed';
-      const stderr = process?.getStderrSnapshot() ?? '';
+      const message = error instanceof Error ? error.message : 'Codex CLI model discovery failed';
+      const stderr = lease?.connection.process.getStderrSnapshot() ?? '';
       return {
         diagnostics: stderr ? `${message}\n\n${stderr}` : message,
         kind: 'completed',
         models: [],
       };
     } finally {
-      if (abortListener && signal) {
-        signal.removeEventListener('abort', abortListener);
-      }
-      transport?.dispose();
-      if (process) {
-        await process.shutdown().catch(() => {});
-      }
+      await lease?.release();
     }
   }
 }
