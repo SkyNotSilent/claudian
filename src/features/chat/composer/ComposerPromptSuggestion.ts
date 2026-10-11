@@ -14,14 +14,16 @@ export class ComposerPromptSuggestion {
   constructor(
     private readonly input: ComposerInputElement,
     private readonly canDisplay: () => boolean,
-    /** Composer region containing the input; any expanded popup control inside it hides the prediction. */
+    /** Composer region containing the input; visible menus and expanded controls hide the prediction. */
     private readonly container: HTMLElement,
   ) {
     input.addEventListener('input', this.refresh);
     input.addEventListener('compositionstart', this.onCompositionStart);
     input.addEventListener('compositionend', this.onCompositionEnd);
     this.observer = new input.ownerDocument.defaultView!.MutationObserver(this.refresh);
-    this.observer.observe(container, { subtree: true, attributes: true, attributeFilter: ['aria-expanded'] });
+    this.observer.observe(container, {
+      subtree: true, childList: true, attributes: true, attributeFilter: ['aria-expanded', 'class'],
+    });
   }
 
   beginTurn(): void {
@@ -81,7 +83,9 @@ export class ComposerPromptSuggestion {
     const turn = this.turn;
     return turn?.binding && turn.suggestion?.turnId === turn.binding.turnId
       && !this.composing && this.input.value === ''
-      && !this.container.querySelector('[aria-expanded="true"]') && this.canDisplay()
+      && !this.container.querySelector(
+        '.claudian-composer-dropdown.is-visible, .claudian-resume-dropdown.visible, button[aria-expanded="true"]',
+      ) && this.canDisplay()
       ? turn.suggestion.text : null;
   }
 

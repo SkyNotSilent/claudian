@@ -14,6 +14,7 @@ export interface ComposerDropdownViewOptions {
 export class ComposerDropdownView {
   private dropdownEl: HTMLElement | null = null;
   private itemEls: HTMLElement[] = [];
+  private readonly inputAttributes = new Map<string, { previous: string | null; written: string | null }>();
 
   constructor(
     private readonly containerEl: HTMLElement,
@@ -25,6 +26,12 @@ export class ComposerDropdownView {
   }
 
   destroy(): void {
+    for (const [attribute, { previous, written }] of this.inputAttributes) {
+      if (this.options.inputEl.getAttribute(attribute) !== written) continue;
+      if (previous === null) this.options.inputEl.removeAttribute(attribute);
+      else this.options.inputEl.setAttribute(attribute, previous);
+    }
+    this.inputAttributes.clear();
     this.dropdownEl?.remove();
     this.dropdownEl = null;
     this.itemEls = [];
@@ -32,8 +39,7 @@ export class ComposerDropdownView {
 
   hide(): void {
     this.dropdownEl?.removeClass('is-visible');
-    this.options.inputEl.removeAttribute?.('aria-activedescendant');
-    this.options.inputEl.setAttribute?.('aria-expanded', 'false');
+    this.#clearActiveDescendant();
   }
 
   isVisible(): boolean {
@@ -42,6 +48,7 @@ export class ComposerDropdownView {
 
   render(items: readonly ComposerDropdownItem[], selectedIndex: number): void {
     const dropdown = this.#ensureDropdown();
+    this.#clearActiveDescendant();
     dropdown.empty();
     this.itemEls = [];
 
@@ -88,19 +95,19 @@ export class ComposerDropdownView {
     }
 
     dropdown.addClass('is-visible');
-    this.options.inputEl.setAttribute?.('aria-expanded', 'true');
     this.updateSelection(selectedIndex);
     this.#positionFixed();
   }
 
   updateSelection(selectedIndex: number): void {
+    this.#clearActiveDescendant();
     for (let index = 0; index < this.itemEls.length; index++) {
       const itemEl = this.itemEls[index];
       const selected = index === selectedIndex;
       itemEl.toggleClass('is-selected', selected);
       itemEl.setAttribute('aria-selected', String(selected));
       if (selected) {
-        this.options.inputEl.setAttribute?.('aria-activedescendant', itemEl.id);
+        this.#setInputAttribute('aria-activedescendant', itemEl.id);
         itemEl.scrollIntoView({ block: 'nearest' });
       }
     }
@@ -115,9 +122,25 @@ export class ComposerDropdownView {
       ].filter(Boolean).join(' '),
       attr: { role: 'listbox', 'aria-label': t('common.inputSuggestions') },
     });
-    this.options.inputEl.setAttribute?.('aria-autocomplete', 'list');
-    this.options.inputEl.setAttribute?.('aria-expanded', 'false');
+    this.#setInputAttribute('aria-autocomplete', 'list');
     return this.dropdownEl;
+  }
+
+  #clearActiveDescendant(): void {
+    const activeId = this.options.inputEl.getAttribute('aria-activedescendant');
+    if (activeId && this.itemEls.some(item => item.id === activeId)) {
+      this.#setInputAttribute('aria-activedescendant', null);
+    }
+  }
+
+  #setInputAttribute(attribute: string, value: string | null): void {
+    const snapshot = this.inputAttributes.get(attribute);
+    if (snapshot) snapshot.written = value;
+    else this.inputAttributes.set(attribute, {
+      previous: this.options.inputEl.getAttribute(attribute), written: value,
+    });
+    if (value === null) this.options.inputEl.removeAttribute(attribute);
+    else this.options.inputEl.setAttribute(attribute, value);
   }
 
   #positionFixed(): void {

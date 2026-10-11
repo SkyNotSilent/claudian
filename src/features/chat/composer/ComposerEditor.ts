@@ -13,6 +13,7 @@ import { filterMarkdownTextTokens } from '@/utils/markdownTextTokens';
 
 const refreshLinks = StateEffect.define<null>();
 const programmatic = Annotation.define<boolean>();
+const INPUT_RELATIONSHIP_ATTRIBUTES = ['aria-autocomplete', 'aria-activedescendant', 'aria-controls', 'aria-haspopup'];
 
 class WikilinkWidget extends WidgetType {
   constructor(
@@ -123,7 +124,8 @@ export class ComposerEditor {
   private placeholderText = 'Ask to make changes, @mention files, run /commands';
   private ghostText: string | null = null;
   private destroyed = false;
-  private ariaObserver: MutationObserver | null = null;
+  private readonly getHostAttribute: (name: string) => string | null;
+  private readonly removeHostAttribute: (name: string) => void;
   private inputPending = false;
   private linkRevision = 0;
   private commandResolver: ComposerCommandResolver | null = null;
@@ -135,6 +137,22 @@ export class ComposerEditor {
       attr: { role: 'textbox', 'aria-label': 'Message', 'aria-multiline': 'true', tabindex: '0', dir: 'auto' },
     });
     this.element = host as unknown as ComposerInputElement;
+    this.getHostAttribute = host.getAttribute.bind(host);
+    const setHostAttribute = host.setAttribute.bind(host);
+    this.removeHostAttribute = host.removeAttribute.bind(host);
+    // Consumers keep the input interface while relationships follow its accessible textbox.
+    host.getAttribute = name => this.view && INPUT_RELATIONSHIP_ATTRIBUTES.includes(name.toLowerCase())
+      ? this.view.contentDOM.getAttribute(name) : this.getHostAttribute(name);
+    host.setAttribute = (name, value) => {
+      if (this.view && INPUT_RELATIONSHIP_ATTRIBUTES.includes(name.toLowerCase())) {
+        this.view.contentDOM.setAttribute(name, value);
+      } else setHostAttribute(name, value);
+    };
+    host.removeAttribute = name => {
+      if (this.view && INPUT_RELATIONSHIP_ATTRIBUTES.includes(name.toLowerCase())) {
+        this.view.contentDOM.removeAttribute(name);
+      } else this.removeHostAttribute(name);
+    };
     this.removeFileLinkHandler = registerFileLinkHandler(app, host);
     const decorations = StateField.define<DecorationSet>({
       create: state => this.decorate(state, Decoration.none),
@@ -272,7 +290,6 @@ export class ComposerEditor {
   destroy(): void {
     this.destroyed = true;
     this.element.removeEventListener('focusin', this.onFocusIn);
-    this.ariaObserver?.disconnect();
     this.removeFileLinkHandler();
     this.view?.destroy();
     this.view = null;
@@ -290,17 +307,11 @@ export class ComposerEditor {
       this.element.setAttribute('tabindex', '-1');
       this.view = new EditorView({ state: this.state, parent: this.element });
       this.syncHostDescription();
-      const attributes = ['aria-autocomplete', 'aria-expanded', 'aria-activedescendant', 'aria-controls', 'aria-haspopup'];
-      const syncAria = () => {
-        for (const attribute of attributes) {
-          const value = this.element.getAttribute(attribute);
-          if (value === null) this.view?.contentDOM.removeAttribute(attribute);
-          else this.view?.contentDOM.setAttribute(attribute, value);
-        }
-      };
-      syncAria();
-      this.ariaObserver = new this.element.ownerDocument.defaultView!.MutationObserver(syncAria);
-      this.ariaObserver.observe(this.element, { attributes: true, attributeFilter: attributes });
+      for (const attribute of INPUT_RELATIONSHIP_ATTRIBUTES) {
+        const value = this.getHostAttribute(attribute);
+        this.removeHostAttribute(attribute);
+        if (value !== null) this.view.contentDOM.setAttribute(attribute, value);
+      }
     }
     this.view.focus();
   };
