@@ -1,4 +1,7 @@
 /** @jest-environment jsdom */
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
 import { EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { FakeAuxiliaryBackend } from '@test/helpers/core/auxiliary/AuxiliaryExecutionTestHarness';
@@ -273,6 +276,9 @@ describe('Vault paths that resemble environment variables', () => {
 });
 
 it('selects a Codex skill in the real widget while excluding provider compact', async () => {
+  const style = document.head.appendChild(document.createElement('style'));
+  style.textContent = readFileSync(path.resolve('src/style/components/composer-dropdown.css'), 'utf8');
+  cleanups.push(async () => { style.remove(); });
   const h = createHarness();
   const createSession = jest.fn();
   ProviderRegistry.register('codex', {
@@ -293,10 +299,13 @@ it('selects a Codex skill in the real widget while excluding provider compact', 
   input().focus();
   typeInstruction('$');
   const option = await screen.findByRole('option', { name: '$review-notes' });
+  const listbox = screen.getByRole('listbox', { name: 'Input suggestions' });
+  expect(getComputedStyle(listbox).display).toBe('block');
   expect(await axe(option)).toHaveNoViolations();
   fireEvent.click(option);
   expect(input().value).toBe('$review-notes ');
-  expect(input().getAttribute('aria-expanded')).toBe('false');
+  expect(getComputedStyle(listbox).display).toBe('none');
+  expect(screen.queryByRole('listbox', { name: 'Input suggestions' })).toBeNull();
   expect(createSession).not.toHaveBeenCalled();
 
   typeInstruction('/');
