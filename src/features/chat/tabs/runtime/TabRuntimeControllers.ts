@@ -380,6 +380,7 @@ export function buildTabRuntimeControllers(
         }
       : undefined,
     toggleFastMode: () => toggleTabServiceTier(runtimeRef.requirePublished(), plugin),
+    onResumeDropdownVisibilityChange: () => ui.promptSuggestion.refresh(),
   });
 
   const inputController = new InputController({

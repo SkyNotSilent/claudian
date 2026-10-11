@@ -23,6 +23,8 @@ export interface BuiltInCommandControllerDeps {
   handleNewConversationCommand?: () => Promise<boolean>;
   /** Toggles the active provider's fast service tier when available. */
   toggleFastMode?: () => Promise<boolean>;
+  /** Runs after the resume picker opens or closes. */
+  onResumeDropdownVisibilityChange?: () => void;
 }
 
 /** Runs main-chat built-in commands and owns the resume picker they open. */
@@ -103,6 +105,7 @@ export class BuiltInCommandController {
     if (this.activeResumeDropdown) {
       this.activeResumeDropdown.destroy();
       this.activeResumeDropdown = null;
+      this.deps.onResumeDropdownVisibilityChange?.();
     }
   }
 
@@ -137,5 +140,6 @@ export class BuiltInCommandController {
         },
       }
     );
+    this.deps.onResumeDropdownVisibilityChange?.();
   }
 }
