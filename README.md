@@ -114,7 +114,7 @@ For Codex on macOS, auto-detection also checks ChatGPT.app in `/Applications` an
 
 > **Note**: On Windows, avoid `.cmd` and `.ps1` wrappers. Use `claude.exe` for native installs, or `cli-wrapper.cjs` for package-manager installs. `cli.js` is only a legacy fallback for older Claude Code npm packages.
 
-**Alternative**: Add your Node.js bin directory to PATH in Settings → Environment → Custom variables.
+**Alternative**: Add your Node.js bin directory to PATH in Settings → Claudian → General → Environment → Shared environment.
 
 ### npm CLI and Node.js not in the same directory
 
@@ -130,13 +130,13 @@ If the paths differ, GUI apps like Obsidian may not find Node.js.
 Either:
 
 1. Install the native binary (recommended).
-2. Add the Node.js path in Settings → Environment: `PATH=/path/to/node/bin`.
+2. Add the Node.js path in Settings → Claudian → General → Environment → Shared environment: `PATH=/path/to/node/bin`.
 
 ### Authentication fails while the CLI subscription works
 
 Claude can report `authentication_failed` inside Obsidian while the selected CLI works with a subscription in a terminal. An `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` inherited from the system environment takes precedence over subscription sign-in, so pointing Claudian at another CLI path does not help. The chat error includes the same recovery steps.
 
-In Settings → Providers → Claude → Custom variables, add an empty assignment for the conflicting credential so Claude falls back to the subscription:
+In Settings → Claudian → Providers → Claude Code → Environment → Custom variables, add an empty assignment for the conflicting credential so Claude falls back to the subscription:
 
 ```env
 ANTHROPIC_API_KEY=
