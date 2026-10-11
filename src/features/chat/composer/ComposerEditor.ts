@@ -124,8 +124,8 @@ export class ComposerEditor {
   private placeholderText = 'Ask to make changes, @mention files, run /commands';
   private ghostText: string | null = null;
   private destroyed = false;
-  private readonly getHostAttribute: (name: string) => string | null;
-  private readonly removeHostAttribute: (name: string) => void;
+  /** The host until the editor mounts, then CodeMirror's content element, which outlives editor teardown. */
+  private textbox: HTMLElement;
   private inputPending = false;
   private linkRevision = 0;
   private commandResolver: ComposerCommandResolver | null = null;
@@ -137,22 +137,7 @@ export class ComposerEditor {
       attr: { role: 'textbox', 'aria-label': 'Message', 'aria-multiline': 'true', tabindex: '0', dir: 'auto' },
     });
     this.element = host as unknown as ComposerInputElement;
-    this.getHostAttribute = host.getAttribute.bind(host);
-    const setHostAttribute = host.setAttribute.bind(host);
-    this.removeHostAttribute = host.removeAttribute.bind(host);
-    // Consumers keep the input interface while relationships follow its accessible textbox.
-    host.getAttribute = name => this.view && INPUT_RELATIONSHIP_ATTRIBUTES.includes(name.toLowerCase())
-      ? this.view.contentDOM.getAttribute(name) : this.getHostAttribute(name);
-    host.setAttribute = (name, value) => {
-      if (this.view && INPUT_RELATIONSHIP_ATTRIBUTES.includes(name.toLowerCase())) {
-        this.view.contentDOM.setAttribute(name, value);
-      } else setHostAttribute(name, value);
-    };
-    host.removeAttribute = name => {
-      if (this.view && INPUT_RELATIONSHIP_ATTRIBUTES.includes(name.toLowerCase())) {
-        this.view.contentDOM.removeAttribute(name);
-      } else this.removeHostAttribute(name);
-    };
+    this.textbox = host;
     this.removeFileLinkHandler = registerFileLinkHandler(app, host);
     const decorations = StateField.define<DecorationSet>({
       create: state => this.decorate(state, Decoration.none),
@@ -249,6 +234,7 @@ export class ComposerEditor {
       this.refreshLinks();
     };
     this.element.isChipRange = (from, to) => isChipRange(this.state.field(decorations), from, to);
+    this.element.getAccessibleTextbox = () => this.textbox;
     host.setAttribute('data-placeholder', this.placeholderText);
     host.addEventListener('focusin', this.onFocusIn);
   }
@@ -307,11 +293,13 @@ export class ComposerEditor {
       this.element.setAttribute('tabindex', '-1');
       this.view = new EditorView({ state: this.state, parent: this.element });
       this.syncHostDescription();
+      // Popups opened before mount keep their relationships on the new textbox.
       for (const attribute of INPUT_RELATIONSHIP_ATTRIBUTES) {
-        const value = this.getHostAttribute(attribute);
-        this.removeHostAttribute(attribute);
+        const value = this.element.getAttribute(attribute);
+        this.element.removeAttribute(attribute);
         if (value !== null) this.view.contentDOM.setAttribute(attribute, value);
       }
+      this.textbox = this.view.contentDOM;
     }
     this.view.focus();
   };
