@@ -20,7 +20,7 @@ export interface TabManagerViewHost extends Component {
   /** Gets view-owned elements that should preserve active tab selection context. */
   getSharedSelectionFocusScopeEls?(): HTMLElement[];
 
-  /** Handles /clear and /new when the active layout gives New different semantics. */
+  /** Handles /new and /clear when the active layout gives New different semantics. */
   handleNewConversationCommand?(): Promise<boolean>;
 }
 
@@ -67,6 +67,11 @@ export interface TabLinkedContentPort {
 /** Composer operations a host view drives without reaching into the composer's DOM or controls. */
 export interface TabComposerPort {
   focus(): void;
+  isFocused(): boolean;
+  /** Whether the mounted input is currently rendered and visible. */
+  isVisible(): boolean;
+  /** Switches between this input and the control focused before the command entered it. */
+  toggleFocus(): void;
   /** Appends text without sending it, as if typed at the end; false when there is nothing to add. */
   appendText(text: string): boolean;
   /** Closes an open toolbar menu; true when one was open. */

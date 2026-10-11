@@ -2663,6 +2663,16 @@ describe('ClaudianPlugin', () => {
     });
   });
 
+  it.each([
+    ['focus-zen-mode-input', 'Toggle chat input focus'],
+    ['toggle-zen-mode-history', 'Toggle zen mode history'],
+  ])('registers %s for hotkey assignment', async (id, name) => {
+    await plugin.onload();
+    const command = getRegisteredCommand(id);
+    expect(command.name).toBe(name);
+    expect(command.checkCallback(true)).toBe(false);
+  });
+
   describe('new-tab command', () => {
     it('routes current-tab commands to the focused view when several leaves exist', async () => {
       await plugin.onload();
@@ -3325,7 +3335,7 @@ describe('ClaudianPlugin', () => {
       await chatHostOf(plugin).conversationLifecycle.setArchived(conversation.id, true);
 
       expect(chatHostOf(plugin).getConversationSync(conversation.id)?.isArchived).toBe(true);
-      expect(Notice).toHaveBeenCalledWith('Codex CLI could not archive or restore its sessions: codex unavailable');
+      expect(Notice).toHaveBeenCalledWith('Codex could not archive or restore its sessions: codex unavailable');
     });
 
     it('does not initialize providers without native session archive', async () => {
