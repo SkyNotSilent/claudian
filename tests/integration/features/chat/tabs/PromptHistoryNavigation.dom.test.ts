@@ -150,26 +150,35 @@ it('recalls and resends visible user text through the real input controller and 
     expect(view.tab.dom.inputEl.value).toBe('');
     await Promise.resolve();
     const baselineAccessibility = await axe(view.tab.dom.inputComposerEl);
-    const knownFingerprints = ['.claudian-input', '.cm-content'].map(target => JSON.stringify({
-      rule: 'aria-allowed-attr', target: [target],
-      any: [], all: [{ id: 'aria-allowed-attr', data: ['aria-expanded="false"'] }], none: [],
-    })).sort();
-    expect(accessibilityFingerprints(baselineAccessibility)).toEqual(knownFingerprints);
+    expect(baselineAccessibility).toHaveNoViolations();
+    expect(accessibilityFingerprints(baselineAccessibility)).toEqual([]);
+    const allowedAttributes = { runOnly: { type: 'rule' as const, values: ['aria-allowed-attr'] } };
+    expect(accessibilityFingerprints(await axe(view.tab.dom.inputComposerEl, allowedAttributes))).toEqual([]);
     expect(key(view, 'ArrowUp').defaultPrevented).toBe(true);
     expect(view.tab.dom.inputEl.value).toBe('Earlier prompt');
     expect(textbox(view).textContent).toBe('Earlier prompt');
-    // The existing dropdown binding writes aria-expanded on a textbox; recall must add no violations.
+    // Recall preserves the real multiline textbox and the complete composer's accessibility.
     await Promise.resolve();
-    expect(accessibilityFingerprints(await axe(view.tab.dom.inputComposerEl)))
-      .toEqual(accessibilityFingerprints(baselineAccessibility));
-    const focusedTextbox = textbox(view);
-    focusedTextbox.setAttribute('aria-checked', 'false');
-    const withFault = await axe(view.tab.dom.inputComposerEl);
-    expect(withFault.violations.map(violation => violation.id)).toEqual(baselineAccessibility.violations.map(violation => violation.id));
-    expect(withFault.violations.flatMap(violation => violation.nodes.map(node => node.target)))
-      .toEqual(baselineAccessibility.violations.flatMap(violation => violation.nodes.map(node => node.target)));
-    expect(accessibilityFingerprints(withFault)).not.toEqual(knownFingerprints);
-    focusedTextbox.removeAttribute('aria-checked');
+    const recalledAccessibility = await axe(view.tab.dom.inputComposerEl);
+    expect(recalledAccessibility).toHaveNoViolations();
+    expect(accessibilityFingerprints(recalledAccessibility)).toEqual([]);
+    expect(accessibilityFingerprints(await axe(view.tab.dom.inputComposerEl, allowedAttributes))).toEqual([]);
+    const focusedTextbox = within(view.tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' });
+    expect(within(view.tab.dom.inputComposerEl).getAllByRole('textbox')).toEqual([focusedTextbox]);
+    expect(focusedTextbox).toBe(textbox(view));
+    expect(focusedTextbox.getAttribute('aria-multiline')).toBe('true');
+    expect(focusedTextbox.textContent).toBe('Earlier prompt');
+    try {
+      focusedTextbox.setAttribute('aria-checked', 'false');
+      const withFault = await axe(view.tab.dom.inputComposerEl, allowedAttributes);
+      expect(accessibilityFingerprints(withFault)).toEqual([JSON.stringify({
+        rule: 'aria-allowed-attr', target: ['.cm-content'],
+        any: [], all: [{ id: 'aria-allowed-attr', data: ['aria-checked="false"'] }], none: [],
+      })]);
+    } finally {
+      focusedTextbox.removeAttribute('aria-checked');
+    }
+    expect(await axe(view.tab.dom.inputComposerEl)).toHaveNoViolations();
     view.saved.length = 0;
     key(view, 'Enter');
     await waitFor(() => expect(view.backend.latest.requests).toHaveLength(2));
