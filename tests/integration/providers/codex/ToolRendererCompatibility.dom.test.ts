@@ -548,7 +548,11 @@ it.each([false, true].flatMap(lateNative => ['text', 'thinking'].map(boundary =>
     (el as HTMLElement).createEl('p', { text: markdown });
   });
   const messagesEl = document.body.createDiv();
-  const plugin = { app: { vault: { adapter: {} } }, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+  const vault = {
+    getAbstractFileByPath: jest.fn(() => null),
+    adapter: { list: jest.fn(async () => ({ files: [], folders: [] })) },
+  };
+  const plugin = { app: { vault }, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
   const renderer = new MessageRenderer(plugin, new Component(), messagesEl);
   const state = new ChatState();
   const subagents = new SubagentManager(() => undefined);
@@ -560,6 +564,25 @@ it.each([false, true].flatMap(lateNative => ['text', 'thinking'].map(boundary =>
     pending = pending.then(() => stream.handleStreamChunk(chunk, response));
   }, '/workspace');
   const notify = async (method: string, params: unknown) => { router.handleNotification(method, params); await pending; };
+  const timerWindow: Window = window;
+  const realSetTimeout = timerWindow.setTimeout.bind(timerWindow);
+  const vaultNotifications: Promise<void>[] = [];
+  // Keep real notification timing, but join this case's callbacks before releasing its fixture.
+  const timeoutSpy = jest.spyOn(timerWindow, 'setTimeout').mockImplementation((handler, delay, ...args) => {
+    if (delay !== 200 || typeof handler !== 'function') return realSetTimeout(handler, delay, ...args);
+    let complete!: () => void;
+    vaultNotifications.push(new Promise<void>(resolve => { complete = resolve; }));
+    return realSetTimeout(function (this: Window, ...callbackArgs: unknown[]) {
+      try {
+        return handler.apply(this, callbackArgs);
+      } finally {
+        complete();
+      }
+    }, delay, ...args);
+  });
+  const joinVaultNotifications = async () => {
+    for (const notification of vaultNotifications) await notification;
+  };
   try {
     state.addMessage(response);
     state.currentContentEl = renderer.addMessage(response).querySelector('.claudian-message-content');
@@ -595,8 +618,14 @@ it.each([false, true].flatMap(lateNative => ['text', 'thinking'].map(boundary =>
     expect(intro.compareDocumentPosition(cards[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(cards[0].compareDocumentPosition(cards[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(cards[1].compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await joinVaultNotifications();
+    expect(vault.getAbstractFileByPath).toHaveBeenCalledWith('note-0.md');
+    expect(vault.getAbstractFileByPath).toHaveBeenCalledWith('note-1.md');
+    expect(vault.adapter.list).toHaveBeenCalledWith('');
     expect((await axe(messagesEl)).violations).toEqual([]);
   } finally {
+    await joinVaultNotifications();
     stream.dispose(); subagents.clear(); renderer.dispose();
+    timeoutSpy.mockRestore();
   }
 });
