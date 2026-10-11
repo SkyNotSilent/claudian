@@ -102,7 +102,7 @@ The following sections use Claude Code as an example.
 
 If Claudian cannot auto-detect a provider CLI, verify that the CLI is installed and available to GUI applications through PATH. Typical errors include `spawn claude ENOENT` and `Claude Code CLI not found`. This issue is common with Node version managers (nvm, fnm, volta).
 
-Leave the CLI path setting empty first so Claudian can auto-detect the CLI. If auto-detection fails, find the executable path and set it in Settings → Advanced → Claude Code CLI path.
+Leave the CLI path setting empty first so Claudian can auto-detect the CLI. If auto-detection fails, find the executable path, open Settings → Claudian → Providers → Claude Code, expand the Claude Code installation card, and set Claude Code CLI path.
 
 For Codex on macOS, auto-detection also checks ChatGPT.app in `/Applications` and `~/Applications`, including its nested `codex-cli/CodexCLI.app` runtime. A configured CLI path or shared PATH entry takes precedence.
 
