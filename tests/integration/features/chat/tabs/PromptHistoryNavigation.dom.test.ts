@@ -337,7 +337,7 @@ it('keeps IME suppression until compositionend despite input and identity resets
 it('retains a provisional tab and runs input lifecycle when recall opens a real command menu', async () => {
   const view = await createView(true);
   try {
-    view.tab.state.messages = [user('one', '/res')];
+    view.tab.state.messages = [user('one', '/ses')];
     expect(view.tab.lifecycleState).toBe('provisional');
     const changed = jest.spyOn(view.tab.controllers.sideChatController, 'handleComposerInput');
     const refreshed = jest.spyOn(view.tab.ui.promptSuggestion, 'refresh');
@@ -345,13 +345,13 @@ it('retains a provisional tab and runs input lifecycle when recall opens a real 
     expect(view.tab.lifecycleState).toBe('open');
     expect(changed).toHaveBeenCalled();
     expect(refreshed).toHaveBeenCalled();
-    await waitFor(() => expect(within(view.tab.dom.inputContainerEl).getByRole('option', { name: /\/resume/ })).toBeDefined());
+    await waitFor(() => expect(within(view.tab.dom.inputContainerEl).getByRole('option', { name: /\/sessions/ })).toBeDefined());
     expect(view.tab.ui.composerDropdown.isVisible()).toBe(true);
     key(view, 'ArrowDown');
-    expect(view.tab.dom.inputEl.value).toBe('/res');
+    expect(view.tab.dom.inputEl.value).toBe('/ses');
     key(view, 'Escape');
     expect(view.tab.ui.composerDropdown.isVisible()).toBe(false);
-    expect(view.tab.dom.inputEl.value).toBe('/res');
+    expect(view.tab.dom.inputEl.value).toBe('/ses');
     key(view, 'Escape');
     expect(view.tab.dom.inputEl.value).toBe('');
   } finally { await view.dispose(); }
