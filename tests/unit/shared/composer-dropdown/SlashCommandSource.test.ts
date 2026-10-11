@@ -157,13 +157,13 @@ describe('SlashCommandSource', () => {
 
     const slashItems = await source.load(match('/'), new AbortController().signal);
     const slashLabels = slashItems.map(item => item.label);
-    expect(slashLabels).toEqual(expect.arrayContaining(['/clear', '/compact']));
+    expect(slashLabels).toEqual(expect.arrayContaining(['/new', '/compact']));
     expect(slashLabels).not.toContain('$review');
 
     const skillItems = await source.load(match('$'), new AbortController().signal);
     const skillLabels = skillItems.map(item => item.label);
     expect(skillLabels).toContain('$review');
-    expect(skillLabels).not.toContain('/clear');
+    expect(skillLabels).not.toContain('/new');
     expect(skillLabels).not.toContain('/compact');
     source.destroy();
   });

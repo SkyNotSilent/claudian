@@ -115,7 +115,7 @@ describe.each(['membership', 'fallback'] as const)('%s catalog path', path => {
     const h = await assemble(path);
     const textbox = await type(h, '/');
     await screen.findByRole('option', { name: /^\/compact\s/ });
-    expect(screen.getByRole('option', { name: /^\/clear\s/ })).toBeDefined();
+    expect(screen.getByRole('option', { name: /^\/new\s/ })).toBeDefined();
     expect(screen.queryByRole('option', { name: '$review-notes' })).toBeNull();
     await type(h, '/comp');
     const compact = await screen.findByRole('option', { name: /^\/compact\s/ });
@@ -140,7 +140,7 @@ describe.each(['membership', 'fallback'] as const)('%s catalog path', path => {
     await type(h, '$');
     const option = await screen.findByRole('option', { name: '$review-notes' });
     expect(screen.queryByRole('option', { name: /^\/compact\s/ })).toBeNull();
-    expect(screen.queryByRole('option', { name: /^\/clear\s/ })).toBeNull();
+    expect(screen.queryByRole('option', { name: /^\/new\s/ })).toBeNull();
     expect(await axe(option)).toHaveNoViolations();
     fireEvent.click(option);
     expect(h.tab.dom.inputEl.value).toBe('$review-notes ');
@@ -155,8 +155,8 @@ describe.each(['membership', 'fallback'] as const)('%s catalog path', path => {
     await type(h, '/');
     await screen.findByRole('option', { name: /^Retry\s/ });
     expect(screen.getByRole('option', { name: 'Could not load provider commands' }).getAttribute('aria-disabled')).toBe('true');
-    fireEvent.click(screen.getByRole('option', { name: /^\/clear\s/ }));
-    expect(h.tab.dom.inputEl.value).toBe('/clear ');
+    fireEvent.click(screen.getByRole('option', { name: /^\/new\s/ }));
+    expect(h.tab.dom.inputEl.value).toBe('/new ');
     await type(h, '/');
     await screen.findByRole('option', { name: /^Retry\s/ });
     expect(screen.queryByRole('option', { name: /^\/compact\s/ })).toBeNull();

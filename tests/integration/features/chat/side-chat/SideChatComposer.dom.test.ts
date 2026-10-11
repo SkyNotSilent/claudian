@@ -78,7 +78,7 @@ it('selects provider compact in an idle child and sends only on a separate Enter
       return textbox;
     };
     await enterText('/');
-    await within(tab.dom.inputContainerEl).findByRole('option', { name: /^\/clear\s/ });
+    await within(tab.dom.inputContainerEl).findByRole('option', { name: /^\/new\s/ });
     expect(within(tab.dom.inputContainerEl).getByRole('option', { name: /^\/side\s/ })).toBeDefined();
     fireEvent.keyDown(within(input).getByRole('textbox'), { key: 'Escape' });
     input.value = '';
