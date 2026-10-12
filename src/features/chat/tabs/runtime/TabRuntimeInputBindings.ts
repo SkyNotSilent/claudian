@@ -1,63 +1,39 @@
-import { PromptHistoryNavigation } from '@/features/chat/tabs/PromptHistoryNavigation';
 import type {
   PublishedTabRuntimeRef,
   TabRuntimeConstructionContext,
-  TabRuntimeShellBundle,
+  TabRuntimeCore,
 } from '@/features/chat/tabs/runtime/TabRuntimeConstruction';
 import {
   cancelSelectedDestinationTurn,
+  handleComposerMenuKeydown,
   sendTabInputMessageFromEnterKey,
   sendTabInputMessageFromExplicitEnterShortcut,
 } from '@/features/chat/tabs/TabInputEvents';
 import { commitProvisionalTab } from '@/features/chat/tabs/TabLifecycle';
-import type { TabControllers, TabInputBindings, TabUIComponents } from '@/features/chat/tabs/types';
+import type { TabControllers, TabUIComponents } from '@/features/chat/tabs/types';
 
 export function buildTabRuntimeInputBindings(
-  shell: TabRuntimeShellBundle,
+  core: TabRuntimeCore,
   ui: TabUIComponents,
   controllers: TabControllers,
   options: TabRuntimeConstructionContext,
   runtimeRef: PublishedTabRuntimeRef,
-): TabInputBindings {
-  const { dom, state } = shell;
+): void {
+  const { dom, state } = core;
   const { plugin } = options;
-
-  const handleComposerChange = () => {
-    const tab = runtimeRef.requirePublished();
-    commitProvisionalTab(tab);
-    controllers.sideChatController.handleComposerInput();
-    ui.composerDropdown.handleInputChange();
-    ui.promptSuggestion.refresh();
-  };
-  const promptHistory = new PromptHistoryNavigation({
-    getMessages: () => state.messages,
-    input: dom.inputEl,
-    onInputReplaced: handleComposerChange,
-  });
+  const promptHistory = controllers.promptHistoryNavigation;
 
   const keydownHandler = (event: KeyboardEvent) => {
+    if (event.key === 'Escape' && event.defaultPrevented) return;
     if ((event.target as HTMLElement | null)?.closest?.('button, a')) return;
     const tab = runtimeRef.requirePublished();
+    if (!options.isRuntimeLive(tab)) return;
     if (sendTabInputMessageFromExplicitEnterShortcut(tab, event)) {
       promptHistory.reset();
       return;
     }
 
-    if (controllers.builtInCommandController.handleResumeKeydown(event)) {
-      return;
-    }
-
-    if (ui.composerDropdown.handleKeydown(event)) {
-      return;
-    }
-
-    if (ui.promptSuggestion.handleKeydown(event)) return;
-
-    if (controllers.sideChatController.destination === 'main') {
-      if (promptHistory.handleKeydown(event)) return;
-    } else {
-      promptHistory.reset();
-    }
+    if (handleComposerMenuKeydown(tab, event)) return;
 
     if (event.key === 'Escape' && !event.isComposing) {
       if (cancelSelectedDestinationTurn(tab)) {
@@ -79,7 +55,10 @@ export function buildTabRuntimeInputBindings(
 
   const inputHandler = () => {
     promptHistory.reset();
-    handleComposerChange();
+    const tab = runtimeRef.requirePublished();
+    commitProvisionalTab(tab);
+    controllers.sideChatController.handleComposerInput();
+    ui.composerDropdown.handleInputChange();
   };
   dom.inputEl.addEventListener('input', inputHandler);
   options.registerCleanup(
@@ -265,9 +244,4 @@ export function buildTabRuntimeInputBindings(
   options.registerCleanup('tab message scroll binding', () => {
     dom.messagesEl.removeEventListener('scroll', scrollHandler);
   });
-  return {
-    installed: true,
-    resetPromptHistory: () => promptHistory.reset(),
-    shouldHandlePromptHistoryEscape: () => controllers.sideChatController.destination === 'main' && promptHistory.canRestoreDraft,
-  };
 }

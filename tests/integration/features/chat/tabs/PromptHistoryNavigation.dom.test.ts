@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { claudeCatalogFixture } from '@test/helpers/claudeModels';
+import { createClaudianView } from '@test/helpers/features/chat/ClaudianViewHarness';
+import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import { FakeSideBackend } from '@test/helpers/features/chat/SideChatSessionHarness';
 import { testDate } from '@test/helpers/testClock';
 import { fireEvent, waitFor, within } from '@testing-library/dom';
@@ -13,10 +15,11 @@ import { App, Component } from 'obsidian';
 
 import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
-import type { ChatMessage, ClaudianSettings, Conversation } from '@/core/types';
+import { type ChatMessage, type ClaudianSettings, type Conversation, isCanonicalUserMessage } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
 import { PromptHistoryNavigation } from '@/features/chat/tabs/PromptHistoryNavigation';
 import { activateTab, destroyTab } from '@/features/chat/tabs/TabLifecycle';
+import { TabManager } from '@/features/chat/tabs/TabManager';
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 
@@ -47,13 +50,14 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 
-async function createView(provisional = false) {
+async function createView(provisional = false, options: { managed?: boolean; draft?: boolean } = {}) {
   const backend = new FakeSideBackend();
   jest.spyOn(ProviderRegistry, 'createExecutionBackend').mockReturnValue(backend);
   const app = new App();
   Object.assign(app.vault.adapter, { basePath: '/vault' });
   Object.assign(app.vault, { on: () => ({}), offref() {} });
-  Object.assign(app.workspace, { getActiveViewOfType: () => null });
+  Object.assign(app.workspace, { getActiveViewOfType: () => null, getActiveFile: () => null, on: () => ({}), offref() {} });
+  Object.assign(app, { metadataCache: { on: () => ({}), offref() {} } });
   const lifecycle = new ProviderExecutionLifecycleRegistry();
   const settings = {
     model: 'claude-sonnet-4-5', effortLevel: 'high', permissionMode: 'manual',
@@ -68,6 +72,10 @@ async function createView(provisional = false) {
     createdAt: testDate().getTime(), lastActivityAt: testDate().getTime(),
   } as unknown as Conversation;
   const saved: unknown[] = [];
+  const conversations = new Map([
+    [conversation.id, conversation],
+    ['other-conversation', { ...conversation, id: 'other-conversation', sessionId: 'other-session' }],
+  ]);
   const plugin = {
     app, settings,
     providerHost: {
@@ -81,25 +89,35 @@ async function createView(provisional = false) {
       recordConversationActivity: async () => {},
     },
     getSessionSnapshotDirectory: () => '/tmp/claudian-sessions', getCommittedSettings: () => settings,
-    getActiveEnvironmentVariables: () => '', getConversationSummary: () => conversation,
-    getConversationSync: () => conversation, getConversationById: async () => conversation,
+    getActiveEnvironmentVariables: () => '', getConversationSummary: (id: string) => conversations.get(id),
+    getConversationSync: (id: string) => conversations.get(id), getCachedConversation: (id: string) => conversations.get(id),
+    getConversationById: async (id: string) => conversations.get(id), findConversationAcrossViews: () => null,
     getConversationList: () => [conversation], renameConversation: async () => {},
     updateConversation: async (_id: string, patch: unknown) => { saved.push(structuredClone(patch)); },
     mutateSettings: async (mutate: (value: ClaudianSettings) => void) => mutate(settings),
     chatModelSelection: { beginIntent: () => 1, commitIntent: async () => true },
   } as unknown as ChatFeatureHost;
-  const tab = await createTabRuntime({
-    plugin, conversation, component: new Component(), containerEl: document.body.createDiv(),
+  const pool = installSessionRuntimePool(plugin);
+  const component = new Component();
+  const containerEl = document.body.createDiv();
+  const manager = options.managed ? new TabManager(plugin, containerEl, component as never, {}, new VaultMentionDataProvider(app)) : null;
+  const tab = manager ? (await manager.createTab(conversation.id))! : await createTabRuntime({
+    plugin, conversation: options.draft ? undefined : conversation, component, containerEl,
     mentionDataProvider: new VaultMentionDataProvider(app), getProviderCatalogConfig: () => null,
     isRuntimeLive: () => true, lifecycleState: provisional ? 'provisional' : 'open',
+    openConversation: async () => {}, startNewConversation: async () => {},
   });
   tab.hydrationState = 'ready';
-  await tab.executionCoordinator.bindConversation({ conversationId: conversation.id, providerId: 'claude' });
-  await tab.executionCoordinator.prepare();
+  if (!options.draft) {
+    await tab.executionCoordinator.bindConversation({ conversationId: conversation.id, providerId: 'claude' });
+    await tab.executionCoordinator.prepare();
+  }
+  jest.spyOn(tab.dom.messagesEl, 'getClientRects').mockImplementation(() =>
+    (tab.dom.contentEl.classList.contains('claudian-hidden') ? [] : [{}]) as unknown as DOMRectList);
   activateTab(tab);
   tab.dom.inputEl.focus();
-  return { tab, backend, saved, conversation,
-    dispose: async () => { await destroyTab(tab); await lifecycle.dispose(); },
+  return { get tab() { return manager?.getActiveTab() ?? tab; }, backend, saved, conversation, manager, plugin,
+    dispose: async () => { if (manager) await manager.destroy(); else await destroyTab(tab); await pool.dispose(); await lifecycle.dispose(); },
   };
 }
 
@@ -138,6 +156,74 @@ async function completeTurn(view: View, text: string): Promise<string> {
   await pending;
   return turnId;
 }
+
+it('resets recalled history when the first send promotes the same presentation to a conversation', async () => {
+  const view = await createView(false, { draft: true });
+  let entered!: () => void;
+  let release!: (conversation: Conversation) => void;
+  const creationEntered = new Promise<void>(resolve => { entered = resolve; });
+  const created = new Promise<Conversation>(resolve => { release = resolve; });
+  view.plugin.createConversation = async () => { entered(); return created; };
+  let pending: Promise<void> | undefined;
+  try {
+    expect(view.tab.state.messages).toEqual([]);
+    const input = view.tab.dom.inputEl;
+    const navigator = view.tab.controllers.promptHistoryNavigation;
+    type(view, 'Promotion prompt');
+    pending = view.tab.controllers.inputController.sendMessage();
+    await creationEntered;
+    await waitFor(() => expect(view.tab.state.messages.filter(isCanonicalUserMessage))
+      .toEqual([expect.objectContaining({ content: 'Promotion prompt' })]));
+    expect(input.value).toBe('');
+    expect(view.tab.state.currentConversationId).toBeNull();
+    key(view, 'ArrowUp');
+    expect(input.value).toBe('Promotion prompt');
+    release(view.conversation);
+    await waitFor(() => expect(view.tab.state.currentConversationId).toBe(view.conversation.id));
+    expect(view.tab.session.conversationId).toBe(view.conversation.id);
+    expect(view.tab.dom.inputEl).toBe(input);
+    expect(view.tab.controllers.promptHistoryNavigation).toBe(navigator);
+    key(view, 'Escape');
+    expect(input.value).toBe('Promotion prompt');
+  } finally {
+    release(view.conversation);
+    try { await pending; } finally { await view.dispose(); }
+  }
+});
+
+it.each([false, true])('restores history before the actual View Scope consumes Escape (Main busy: %s)', async busy => {
+  const view = await createView();
+  let pending: Promise<void> | undefined;
+  try {
+    view.tab.state.messages = [user('previous', 'Previous prompt')];
+    if (busy) {
+      type(view, 'Running prompt');
+      pending = view.tab.controllers.inputController.sendMessage();
+    }
+    await waitFor(() => expect(view.backend.latest.getStatus()).toBe(busy ? 'executing' : 'idle'));
+    expect(view.tab.state.isStreaming).toBe(busy);
+    key(view, 'ArrowUp');
+    expect(view.tab.dom.inputEl.value).toBe(busy ? 'Running prompt' : 'Previous prompt');
+    const native = view.backend.latest;
+    const cancellations = native.cancelCalls;
+    const root = createClaudianView({ host: view.plugin, containerEl: view.tab.dom.contentEl,
+      contentEl: view.tab.dom.contentEl, tabManager: { getActiveTab: () => view.tab } });
+    root.wireEventHandlers();
+    const handler = root.scope.handlers.find((entry: { key: string }) => entry.key === 'Escape');
+    const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    // Obsidian consumes a false-returning Scope handler before the same event reaches the DOM.
+    expect(handler.func(event)).toBe(false);
+    event.preventDefault();
+    textbox(view).dispatchEvent(event);
+    expect(view.tab.dom.inputEl.value).toBe('');
+    expect(native.cancelCalls).toBe(cancellations);
+    expect(native.getStatus()).toBe(busy ? 'executing' : 'idle');
+    if (busy) {
+      native.emitText('Completed answer'); native.complete();
+      await pending;
+    }
+  } finally { await view.dispose(); }
+});
 
 it('recalls and resends visible user text through the real input controller and persistence port', async () => {
   const view = await createView();
@@ -307,23 +393,26 @@ it('abandons navigation after real user edits and retains the edited text on Esc
 });
 
 it('resets on a conversation identity round trip without intervening keys', async () => {
-  const view = await createView();
+  const view = await createView(false, { managed: true });
   try {
     view.tab.state.messages = [user('one', 'Existing prompt')];
     key(view, 'ArrowUp');
-    view.tab.session.bindConversation('other-conversation', 'claude');
-    view.tab.session.bindConversation(view.conversation.id, 'claude');
+    await view.manager!.openConversation('other-conversation');
+    await view.manager!.openConversation(view.conversation.id);
+    view.tab.dom.inputEl.focus();
     key(view, 'Escape');
     expect(view.tab.dom.inputEl.value).toBe('Existing prompt');
     view.tab.dom.inputEl.value = ''; fireEvent.input(view.tab.dom.inputEl);
     view.tab.state.messages = [user('replacement', 'New conversation text')];
+    // Inactive Escape moved focus to the transcript; a new recall starts from the composer again.
+    view.tab.dom.inputEl.focus();
     key(view, 'ArrowUp');
     expect(view.tab.dom.inputEl.value).toBe('New conversation text');
   } finally { await view.dispose(); }
 });
 
 it('keeps IME suppression until compositionend despite input and identity resets', async () => {
-  const view = await createView();
+  const view = await createView(false, { draft: true });
   try {
     view.tab.state.messages = [user('one', 'Existing prompt')];
     key(view, 'ArrowUp');
@@ -333,8 +422,8 @@ it('keeps IME suppression until compositionend despite input and identity resets
     view.tab.dom.inputEl.focus();
     view.tab.dom.inputEl.value = '';
     fireEvent.input(view.tab.dom.inputEl);
-    view.tab.session.bindConversation('other-conversation', 'claude');
-    view.tab.session.bindConversation(view.conversation.id, 'claude');
+    view.tab.session.runtime.selectDraft('claude', 'different-draft-model');
+    view.tab.session.runtime.selectDraft('claude', 'claude-sonnet-4-5');
     expect(key(view, 'ArrowUp', { isComposing: false }).inputPrevented).toBe(false);
     expect(view.tab.dom.inputEl.value).toBe('');
     fireEvent.compositionEnd(textbox(view));
@@ -436,7 +525,7 @@ it('preserves real prediction acceptance priority and refreshes the ghost after 
   try {
     const turnId = await completeTurn(view, 'Original prompt');
     view.backend.latest.emitSessionEvent({ type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Suggested next prompt' });
-    expect(within(view.tab.dom.inputEl).getByText('Suggested next prompt')).toBeDefined();
+    await waitFor(() => expect(within(view.tab.dom.inputEl).getByText('Suggested next prompt')).toBeDefined());
     key(view, 'ArrowUp');
     expect(view.tab.dom.inputEl.value).toBe('Original prompt');
     expect(within(view.tab.dom.inputEl).queryByText('Suggested next prompt')).toBeNull();
