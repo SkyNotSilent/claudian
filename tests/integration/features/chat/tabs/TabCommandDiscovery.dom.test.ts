@@ -1,6 +1,7 @@
 /** @jest-environment jsdom */
 import '@/providers';
 
+import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import { createHarness, releaseSideChatHarnesses } from '@test/helpers/features/chat/SideChatDOMHarness';
 import { fireEvent, screen, waitFor, within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
@@ -58,20 +59,31 @@ async function assemble(path: 'membership' | 'fallback') {
     getActiveEnvironmentVariables: () => '',
     getConversationSummary: () => conversation,
     getConversationSync: () => conversation,
+    getCachedConversation: () => conversation,
     getConversationById: async () => conversation,
     getConversationList: () => [conversation],
+    executionPersistence: {
+      registerExecutionBinding() {}, releaseExecutionBinding() {},
+      assertConversationExecutionAuthority: async () => {},
+      persistExecutionSnapshot: async () => true, recordConversationActivity: async () => {},
+    },
   } as unknown as ChatFeatureHost;
+  const pool = installSessionRuntimePool(plugin);
   const listing: jest.Mocked<CodexSkillListProvider> = {
     listSkills: jest.fn().mockResolvedValue([skill()]), invalidate: jest.fn(),
   };
   ProviderWorkspaceRegistry.setServices('codex', { commandCatalog: new CodexCommandCatalog(listing) });
   let live = true;
+  const currentIdentity = () => live && tab ? { id: tab.id, conversationId: tab.conversationId,
+    providerId: tab.providerId, draftModel: tab.draftModel, lifecycleState: tab.lifecycleState } : null;
   const membership: TabMembershipView = {
     isDestroyed: () => !live,
     getActiveTabId: () => tab?.id ?? null,
+    getRetainedActiveTabId: () => tab?.id ?? null,
+    getIdentity: id => id === tab?.id ? currentIdentity() : null,
     getTab: id => live && tab?.id === id ? tab : null,
     getAllTabs: () => live && tab ? [tab] : [],
-    getTabIdentities: () => live && tab ? [tab.session] : [],
+    getTabIdentities: () => { const identity = currentIdentity(); return identity ? [identity] : []; },
     isTabAlive: candidate => live && candidate.id === tab?.id && candidate.lifecycleState !== 'closing',
     isTabStateMutable: candidate => live && candidate.id === tab?.id,
     isCloseClaimed: () => false,
@@ -82,6 +94,7 @@ async function assemble(path: 'membership' | 'fallback') {
     mentionDataProvider: new VaultMentionDataProvider(app),
     getProviderCatalogConfig: context => path === 'membership' ? discovery.getProviderCatalogConfig(context) : null,
     isRuntimeLive: () => live,
+    openConversation: async () => {}, startNewConversation: async () => {},
   });
   discovery.registerTab(tab.id);
   const setCatalog = jest.spyOn(tab.ui.composerDropdown, 'setProviderCatalog');
@@ -93,6 +106,7 @@ async function assemble(path: 'membership' | 'fallback') {
     live = false;
     discovery.releaseTab(tab.id);
     await destroyTab(tab);
+    await pool.dispose();
   };
   cleanups.push(close);
   return { tab, plugin, listing, discovery, ownedDiscovery, send, close };

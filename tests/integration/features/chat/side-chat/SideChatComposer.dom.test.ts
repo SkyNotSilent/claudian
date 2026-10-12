@@ -1,6 +1,7 @@
 /** @jest-environment jsdom */
 import '@/providers';
 
+import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import {
   createHarness,
   releaseSideChatHarnesses,
@@ -45,8 +46,16 @@ it('selects provider compact in an idle child and sends only on a separate Enter
     getActiveEnvironmentVariables: () => '',
     getConversationSummary: () => conversation,
     getConversationSync: () => conversation,
+    getCachedConversation: () => conversation,
+    getConversationById: async () => conversation,
     getConversationList: () => [conversation],
+    executionPersistence: {
+      registerExecutionBinding() {}, releaseExecutionBinding() {},
+      assertConversationExecutionAuthority: async () => {},
+      persistExecutionSnapshot: async () => true, recordConversationActivity: async () => {},
+    },
   } as unknown as ChatFeatureHost;
+  const pool = installSessionRuntimePool(plugin);
   const catalog = new RuntimeCommandCatalog({
     dropdownConfig: {
       providerId: 'claude', triggerChars: ['/'], builtInPrefix: '/', skillPrefix: '/', commandPrefix: '/',
@@ -62,6 +71,7 @@ it('selects provider compact in an idle child and sends only on a separate Enter
     plugin, conversation, component: new Component(), containerEl: document.body.createDiv(),
     mentionDataProvider: new VaultMentionDataProvider(app),
     getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
+    openConversation: async () => {}, startNewConversation: async () => {},
   });
   try {
     tab.state.messages = [...conversation.messages];
@@ -116,6 +126,7 @@ it('selects provider compact in an idle child and sends only on a separate Enter
     await send.mock.results[0].value;
   } finally {
     await destroyTab(tab);
+    await pool.dispose();
     ProviderWorkspaceRegistry.setServices('claude', undefined);
     globalThis.ResizeObserver = originalResizeObserver;
   }
@@ -180,6 +191,27 @@ it('opens expanded with a joined border, then collapses to an idle chip over the
   fireEvent.keyDown(statusToggle, { key: 'Enter' });
   fireEvent.click(statusToggle);
   expect(harness.controller.destination).toBe('side');
+});
+
+it('toggles full height without changing the destination, and keeps it across collapse', async () => {
+  const harness = createHarness();
+  const { started } = await startSideChat(harness);
+  harness.backend.latest.establishChild('child-session');
+  harness.backend.latest.complete();
+  await started;
+
+  const panel = screen.getByRole('heading', { name: 'Side chat' }).closest<HTMLElement>('.claudian-side-chat-panel')!;
+  const fullHeight = within(panel).getByRole('button', { name: 'Full height' });
+  expect(fullHeight.getAttribute('aria-pressed')).toBe('false');
+  fireEvent.click(fullHeight);
+  expect(fullHeight.getAttribute('aria-pressed')).toBe('true');
+  expect(harness.controller.destination).toBe('side');
+  expect(harness.destinationChanges).toEqual(['side']);
+  expect(await axe(harness.composerEl)).toHaveNoViolations();
+
+  harness.controller.collapse();
+  harness.controller.expand();
+  expect(within(panel).getByRole('button', { name: 'Full height' }).getAttribute('aria-pressed')).toBe('true');
 });
 
 it('keeps separate main and side drafts across expansion changes', async () => {
@@ -386,6 +418,41 @@ it('uses the navigation row for a single-tab chip and moves it above navigation 
   expect(host.childElementCount).toBe(0);
 });
 
+it('applies full height to the view only for the active tab expanded in the footer', async () => {
+  const harness = createHarness();
+  let activeController = harness.controller;
+  const { placement, chatPanelEl } = mountChipPlacement({
+    getActiveTab: () => chipTabFor(activeController),
+    isWide: () => false,
+    getTabCount: () => 2,
+  });
+  placement.updateChip();
+  const { started } = await startSideChat(harness);
+  harness.backend.latest.establishChild('child-session');
+  harness.backend.latest.complete();
+  await started;
+  const isFullHeight = () => chatPanelEl.classList.contains('claudian-chat-panel--side-chat-full-height');
+  expect(isFullHeight()).toBe(false);
+
+  fireEvent.click(screen.getByRole('button', { name: 'Full height' }));
+  expect(isFullHeight()).toBe(true);
+
+  activeController = createHarness().controller;
+  placement.updateChip();
+  expect(isFullHeight()).toBe(false);
+  activeController = harness.controller;
+  placement.updateChip();
+  expect(isFullHeight()).toBe(true);
+
+  harness.controller.collapse();
+  expect(isFullHeight()).toBe(false);
+  harness.controller.expand();
+  expect(isFullHeight()).toBe(true);
+
+  await harness.controller.discard();
+  expect(isFullHeight()).toBe(false);
+});
+
 /** Mounts the view footer placement over a fake active tab whose chip host is the real side chat. */
 function mountChipPlacement(context: {
   getActiveTab(): { placement: ReturnType<typeof createTabPlacementPort> };
@@ -395,23 +462,29 @@ function mountChipPlacement(context: {
   const chatPanelEl = document.body.appendChild(document.createElement('div'));
   const placement = new ChatPresentationPlacement({
     getActiveTab: () => context.getActiveTab() as never,
-    getTab: () => null,
     isWide: () => context.isWide(),
     getTabCount: () => context.getTabCount(),
   });
   placement.mount(chatPanelEl);
   const footer = chatPanelEl.querySelector<HTMLElement>('.claudian-input-footer')!;
   const navHost = footer.querySelector<HTMLElement>('.claudian-view-input-nav-row')!;
-  return { placement, footer, navHost };
+  return { placement, chatPanelEl, footer, navHost };
 }
 
 const chipTabs = new WeakMap<object, { placement: ReturnType<typeof createTabPlacementPort> }>();
 
 /** A stable tab per side chat controller whose placement routes the chip like an assembled tab. */
-function chipTabFor(controller: { setCollapsedHost(host: HTMLElement | null): void }) {
+function chipTabFor(controller: {
+  setCollapsedHost(host: HTMLElement | null): void;
+  setFullHeightHost(host: HTMLElement | null): void;
+}) {
   let tab = chipTabs.get(controller);
   if (!tab) {
-    tab = { placement: createTabPlacementPort({} as never, host => controller.setCollapsedHost(host)) };
+    tab = { placement: createTabPlacementPort(
+      {} as never,
+      host => controller.setCollapsedHost(host),
+      host => controller.setFullHeightHost(host),
+    ) };
     chipTabs.set(controller, tab);
   }
   return tab;

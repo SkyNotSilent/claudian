@@ -1,5 +1,7 @@
 import '@/providers';
 
+import { createTabSession } from '@test/helpers/ConversationPorts';
+
 import type { ProviderCommandDiscoverySource } from '@/core/providers/commands/ProviderCommandDiscoveryStore';
 import type { ProviderCommandEntry } from '@/core/providers/commands/ProviderCommandEntry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
@@ -28,6 +30,7 @@ function createTab(model: string, customContextLimits: Record<string, number>, u
     state: { usage },
     ui: { contextUsageMeter: { update } },
   } as unknown as AssembledTabRuntime;
+  Object.assign(tab, { session: createTabSession({ id: 'test', lifecycleState: 'open', conversationId: null, providerId: 'claude', draftModel: model }, {} as never) });
   const plugin = {
     getCommittedSettings: () => plugin.settings,
     settings: {
