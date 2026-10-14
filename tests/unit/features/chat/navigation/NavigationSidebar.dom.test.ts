@@ -6,7 +6,9 @@ import path from 'node:path';
 import { fireEvent, within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
 
+import type { ProviderCapabilities } from '@/core/providers/types';
 import { NavigationSidebar } from '@/features/chat/navigation/NavigationSidebar';
+import { MessageActions } from '@/features/chat/rendering/MessageActions';
 
 const css = readFileSync(path.resolve('src/style/components/nav-sidebar.css'), 'utf8');
 const sidebars: NavigationSidebar[] = [];
@@ -64,4 +66,56 @@ it('keeps the navigation out of the accessibility tree and tab order while it is
   expect(view.queryAllByRole('button')).toEqual([]);
   // The controls still exist, so the empty query reflects their hidden state.
   expect(view.getAllByRole('button', { hidden: true })).toHaveLength(5);
+});
+
+// Expected names are acceptance literals: the title keeps whole characters and
+// the 80-unit cap (ellipsis included), never slicing a surrogate pair apart.
+const EMOJI = '😀';
+const directoryTitleCases = [
+  [
+    'truncates at a surrogate pair boundary without splitting the pair',
+    `${'x'.repeat(76)}${EMOJI}tail`,
+    `${'x'.repeat(76)}...`,
+  ],
+  [
+    'keeps a surrogate pair that fits before the truncation boundary',
+    `${'x'.repeat(75)}${EMOJI}tail`,
+    `${'x'.repeat(75)}${EMOJI}...`,
+  ],
+  [
+    'leaves an exact 80-unit title unchanged',
+    `${'x'.repeat(78)}${EMOJI}`,
+    `${'x'.repeat(78)}${EMOJI}`,
+  ],
+] as const;
+
+function addUserPrompt(messagesEl: HTMLElement, rawText: string): HTMLElement {
+  const msgEl = messagesEl.createDiv({ cls: 'claudian-message claudian-message-user' });
+  msgEl.createDiv({ cls: 'claudian-message-content', text: rawText });
+  return msgEl;
+}
+
+describe.each(directoryTitleCases)('directory title: %s', (_name, rawText, expectedTitle) => {
+  it('shows the published title from real MessageActions metadata', () => {
+    const { messagesEl, view } = mount(true);
+    messagesEl.replaceChildren();
+    const msgEl = addUserPrompt(messagesEl, rawText);
+    const actions = new MessageActions(
+      { settings: {} } as never, messagesEl, () => ({}) as ProviderCapabilities, {},
+    );
+    actions.applyTocTitle(msgEl, rawText);
+
+    fireEvent.click(view.getByRole('button', { name: 'Conversation directory' }));
+    expect(view.getByRole('button', { name: `1. ${expectedTitle}` }).textContent).toBe(`1. ${expectedTitle}`);
+  });
+});
+
+it('falls back to visible message text without metadata through the same formatter', () => {
+  const rawText = `${'x'.repeat(76)}${EMOJI}tail`;
+  const { messagesEl, view } = mount(true);
+  messagesEl.replaceChildren();
+  addUserPrompt(messagesEl, rawText);
+
+  fireEvent.click(view.getByRole('button', { name: 'Conversation directory' }));
+  expect(view.getByRole('button', { name: `1. ${'x'.repeat(76)}...` }).textContent).toBe(`1. ${'x'.repeat(76)}...`);
 });
