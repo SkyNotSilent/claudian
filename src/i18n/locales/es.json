@@ -345,6 +345,14 @@
       "mode": "Entrega",
       "modeSteer": "Dirigir el turno en curso",
       "modeInterrupt": "Interrumpir el trabajo actual"
+    },
+    "navigation": {
+      "scrollToTop": "Desplazarse al principio",
+      "previousMessage": "Mensaje anterior",
+      "directory": "Índice de la conversación",
+      "nextMessage": "Mensaje siguiente",
+      "scrollToBottom": "Desplazarse al final",
+      "emptyDirectory": "No hay prompts de usuario en esta conversación"
     }
   },
   "settings": {

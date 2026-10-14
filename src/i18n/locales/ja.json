@@ -345,6 +345,14 @@
       "mode": "配信",
       "modeSteer": "実行中のターンに追加",
       "modeInterrupt": "現在の作業を中断"
+    },
+    "navigation": {
+      "scrollToTop": "最上部へスクロール",
+      "previousMessage": "前のメッセージ",
+      "directory": "会話の目次",
+      "nextMessage": "次のメッセージ",
+      "scrollToBottom": "最下部へスクロール",
+      "emptyDirectory": "この会話にはユーザープロンプトがありません"
     }
   },
   "settings": {

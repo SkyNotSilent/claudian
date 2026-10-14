@@ -345,6 +345,14 @@
       "mode": "Доставка",
       "modeSteer": "Добавить в текущий ход",
       "modeInterrupt": "Прервать текущую работу"
+    },
+    "navigation": {
+      "scrollToTop": "Прокрутить вверх",
+      "previousMessage": "Предыдущее сообщение",
+      "directory": "Содержание разговора",
+      "nextMessage": "Следующее сообщение",
+      "scrollToBottom": "Прокрутить вниз",
+      "emptyDirectory": "В этом разговоре нет пользовательских запросов"
     }
   },
   "settings": {
