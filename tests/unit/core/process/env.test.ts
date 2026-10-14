@@ -413,6 +413,22 @@ describe('getEnhancedPath', () => {
           expect(result).not.toContain('v20.10.0');
         }
       );
+
+      it('resolves a custom v-prefixed alias through its alias file', () => {
+        delete process.env.NVM_BIN;
+        process.env.NVM_DIR = '/custom/nvm';
+        mockNvm({
+          nvmDir: '/custom/nvm',
+          aliasFiles: {
+            '/custom/nvm/alias/default': 'vault-node',
+            '/custom/nvm/alias/vault-node': 'v24.16.0',
+          },
+          versions: ['v24.16.0'],
+        });
+
+        const entries = parsePathEntries(getEnhancedPath());
+        expect(entries).toContain('/custom/nvm/versions/node/v24.16.0/bin');
+      });
     });
   });
 
