@@ -38,12 +38,12 @@ describe('renderInlineEditMarkdownPreview', () => {
       app,
       component,
       container,
-      markdown: 'Inline \\(x<y\\).\n\\[y^2\\]',
+      markdown: 'Inline \\(x<y\\).\n\\[y^2\\]\nPadded \\(  x + y  \\).',
       sourcePath: 'math/note.md',
     });
 
     expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
-      'Inline $x<y$.\n$$y^2$$',
+      'Inline $x<y$.\n$$y^2$$\nPadded $x + y$.',
       container,
       'math/note.md',
       component
