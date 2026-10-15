@@ -345,6 +345,14 @@
       "mode": "Remise",
       "modeSteer": "Orienter le tour en cours",
       "modeInterrupt": "Interrompre le travail en cours"
+    },
+    "navigation": {
+      "scrollToTop": "Défiler vers le haut",
+      "previousMessage": "Message précédent",
+      "directory": "Sommaire de la conversation",
+      "nextMessage": "Message suivant",
+      "scrollToBottom": "Défiler vers le bas",
+      "emptyDirectory": "Aucun prompt utilisateur dans cette conversation"
     }
   },
   "settings": {

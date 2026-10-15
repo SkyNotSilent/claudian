@@ -34,10 +34,21 @@ afterEach(() => {
 });
 
 it.each([
-  { language: '', expectedClass: '', expectedLabel: null, hasLanguage: false },
-  { language: 'typescript', expectedClass: 'language-typescript', expectedLabel: 'typescript', hasLanguage: true },
+  { language: '', expectedClass: '', expectedLabel: null, hasLanguage: false, accessibleName: 'Copy' },
+  {
+    language: 'typescript', expectedClass: 'language-typescript', expectedLabel: 'typescript',
+    hasLanguage: true, accessibleName: 'Copy typescript code',
+  },
+  {
+    language: 'objective-c', expectedClass: 'language-objective-c', expectedLabel: 'objective-c',
+    hasLanguage: true, accessibleName: 'Copy objective-c code',
+  },
+  {
+    language: 'css-extras', expectedClass: 'language-css-extras', expectedLabel: 'css-extras',
+    hasLanguage: true, accessibleName: 'Copy css-extras code',
+  },
 ])('adopts a fresh $language fence with an accessible copy control', async ({
-  language, expectedClass, expectedLabel, hasLanguage,
+  language, expectedClass, expectedLabel, hasLanguage, accessibleName,
 }) => {
   let pre!: HTMLPreElement;
   let code!: HTMLElement;
@@ -65,7 +76,7 @@ it.each([
   expect(pre.parentElement).toBe(wrapper);
   expect(code.parentElement).toBe(pre);
   expect(code.textContent).toBe('const x = 1;');
-  const accessibleCopy = within(host).getByRole('button', { name: hasLanguage ? 'Copy typescript code' : 'Copy' });
+  const accessibleCopy = within(host).getByRole('button', { name: accessibleName });
   expect(accessibleCopy.getAttribute('type')).toBe('button');
   accessibleCopy.focus();
   expect(document.activeElement).toBe(accessibleCopy);
@@ -79,16 +90,26 @@ it.each([
   expect((await axe(host)).violations).toEqual([]);
 });
 
-it('copies code through its language label and exposes the copied feedback accessibly', async () => {
-  jest.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, _markdown, target) => {
+it.each([
+  { language: 'typescript', code: 'const x = 1;' },
+  { language: 'objective-c', code: '@implementation Thing\n@end' },
+])('copies $language code through its language label and exposes the copied feedback accessibly', async ({
+  language, code,
+}) => {
+  jest.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, markdown, target) => {
+    const renderedLanguage = markdown.match(/^```([^\n]*)/)?.[1] ?? '';
     const pre = (target as HTMLElement).createEl('pre');
-    pre.createEl('code', { cls: 'language-typescript', text: 'const x = 1;' });
+    pre.createEl('code', {
+      cls: renderedLanguage ? `language-${renderedLanguage}` : undefined,
+      text: code,
+    });
   });
-  await renderer.renderContent(host, '```typescript\nconst x = 1;\n```');
+  await renderer.renderContent(host, `\`\`\`${language}\n${code}\n\`\`\``);
 
   // WCAG 2.5.3: the accessible name contains the visible language label and names the action.
-  const label = within(host).getByRole('button', { name: 'Copy typescript code' });
-  expect(label.textContent).toBe('typescript');
+  const idleName = `Copy ${language} code`;
+  const label = within(host).getByRole('button', { name: idleName });
+  expect(label.textContent).toBe(language);
   const status = within(host).getByRole('status');
   expect(status.textContent).toBe('');
   const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
@@ -101,14 +122,14 @@ it('copies code through its language label and exposes the copied feedback acces
     });
     label.click();
     await Promise.resolve();
-    expect(writeText).toHaveBeenCalledWith('const x = 1;');
+    expect(writeText).toHaveBeenCalledWith(code);
     expect(label.textContent).toBe('Copied!');
     expect(within(host).getByRole('button', { name: 'Copied!' })).toBe(label);
     expect(status.textContent).toBe('Copied!');
 
     jest.advanceTimersByTime(1_500);
-    expect(label.textContent).toBe('typescript');
-    expect(within(host).getByRole('button', { name: 'Copy typescript code' })).toBe(label);
+    expect(label.textContent).toBe(language);
+    expect(within(host).getByRole('button', { name: idleName })).toBe(label);
     expect(status.textContent).toBe('');
   } finally {
     jest.clearAllTimers();

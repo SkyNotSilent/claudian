@@ -345,6 +345,14 @@
       "mode": "Zustellung",
       "modeSteer": "In laufende Runde einsteuern",
       "modeInterrupt": "Aktuelle Arbeit unterbrechen"
+    },
+    "navigation": {
+      "scrollToTop": "Nach oben scrollen",
+      "previousMessage": "Vorherige Nachricht",
+      "directory": "Unterhaltungsübersicht",
+      "nextMessage": "Nächste Nachricht",
+      "scrollToBottom": "Nach unten scrollen",
+      "emptyDirectory": "Keine Benutzer-Prompts in dieser Unterhaltung"
     }
   },
   "settings": {

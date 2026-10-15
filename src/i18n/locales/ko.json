@@ -345,6 +345,14 @@
       "mode": "전달",
       "modeSteer": "실행 중인 턴에 추가",
       "modeInterrupt": "현재 작업 중단"
+    },
+    "navigation": {
+      "scrollToTop": "맨 위로 스크롤",
+      "previousMessage": "이전 메시지",
+      "directory": "대화 목차",
+      "nextMessage": "다음 메시지",
+      "scrollToBottom": "맨 아래로 스크롤",
+      "emptyDirectory": "이 대화에는 사용자 프롬프트가 없습니다"
     }
   },
   "settings": {

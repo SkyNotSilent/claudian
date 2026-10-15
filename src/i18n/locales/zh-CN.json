@@ -345,6 +345,14 @@
       "mode": "投递方式",
       "modeSteer": "插入正在进行的轮次",
       "modeInterrupt": "中断当前工作"
+    },
+    "navigation": {
+      "scrollToTop": "滚动到顶部",
+      "previousMessage": "上一条消息",
+      "directory": "对话目录",
+      "nextMessage": "下一条消息",
+      "scrollToBottom": "滚动到底部",
+      "emptyDirectory": "此对话中暂无用户提示词"
     }
   },
   "settings": {

@@ -345,6 +345,14 @@
       "mode": "Delivery",
       "modeSteer": "Steer into running turn",
       "modeInterrupt": "Interrupt current work"
+    },
+    "navigation": {
+      "scrollToTop": "Scroll to top",
+      "previousMessage": "Previous message",
+      "directory": "Conversation directory",
+      "nextMessage": "Next message",
+      "scrollToBottom": "Scroll to bottom",
+      "emptyDirectory": "No user prompts in this conversation"
     }
   },
   "settings": {

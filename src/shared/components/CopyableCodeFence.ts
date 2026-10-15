@@ -36,7 +36,7 @@ export function enhanceRenderedCodeFence(pre: HTMLPreElement): HTMLElement {
   wrapper.appendChild(pre);
 
   const code = pre.querySelector<HTMLElement>('code[class*="language-"]');
-  const language = code?.className.match(/language-(\w+)/)?.[1];
+  const language = code?.className.match(/language-([\w-]+)/)?.[1];
   if (code && language) {
     wrapper.classList.add('has-language');
     const copyLabel = t('chat.codeBlock.copyAriaLabel', { language });
