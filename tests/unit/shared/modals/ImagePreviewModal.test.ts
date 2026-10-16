@@ -131,8 +131,11 @@ describe('ImagePreviewModal', () => {
     const escapeModal = new ImagePreviewModal();
     escapeModal.open(escapeHarness.ownerDocument, IMAGE);
     const removeEscapeOverlay = jest.spyOn(escapeHarness.overlayEl, 'remove');
-    escapeHarness.listeners.get('keydown')?.[0]({ key: 'Escape' });
+    const escapeEvent = { key: 'Escape', preventDefault: jest.fn(), stopPropagation: jest.fn() };
+    escapeHarness.listeners.get('keydown')?.[0](escapeEvent);
     expect(removeEscapeOverlay).toHaveBeenCalledTimes(1);
+    expect(escapeEvent.preventDefault).toHaveBeenCalledTimes(1);
+    expect(escapeEvent.stopPropagation).toHaveBeenCalledTimes(1);
 
     const buttonHarness = createDocumentHarness();
     const buttonModal = new ImagePreviewModal();
@@ -150,6 +153,30 @@ describe('ImagePreviewModal', () => {
     expect(removeBackgroundOverlay).not.toHaveBeenCalled();
     overlayClick?.({ target: overlayHarness.overlayEl });
     expect(removeBackgroundOverlay).toHaveBeenCalledTimes(1);
+  });
+
+  it('attaches its key listener to the owner window ahead of the keymap, or the document without a window', () => {
+    const windowAdd = jest.fn();
+    const windowRemove = jest.fn();
+    const harness = createDocumentHarness();
+    Object.assign(harness.ownerDocument, {
+      defaultView: { addEventListener: windowAdd, removeEventListener: windowRemove },
+    });
+    const modal = new ImagePreviewModal();
+
+    modal.open(harness.ownerDocument, IMAGE);
+
+    expect(windowAdd).toHaveBeenCalledWith('keydown', expect.any(Function), true);
+    expect(harness.ownerDocument.addEventListener).not.toHaveBeenCalled();
+    const handleKeyDown = windowAdd.mock.calls[0][1] as (event: unknown) => void;
+    handleKeyDown({ key: 'Escape', preventDefault: jest.fn(), stopPropagation: jest.fn() });
+    expect(windowRemove).toHaveBeenCalledWith('keydown', handleKeyDown, true);
+
+    const fallbackHarness = createDocumentHarness();
+    const fallbackModal = new ImagePreviewModal();
+    fallbackModal.open(fallbackHarness.ownerDocument, IMAGE);
+    expect(fallbackHarness.ownerDocument.addEventListener)
+      .toHaveBeenCalledWith('keydown', expect.any(Function), true);
   });
 
   it('does not restore a disconnected prior focus target', () => {
