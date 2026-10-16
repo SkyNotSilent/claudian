@@ -1,3 +1,5 @@
+import { type Keymap, Scope } from 'obsidian';
+
 import type { ImageAttachment } from '@/core/types';
 import { t } from '@/i18n/i18n';
 
@@ -9,21 +11,11 @@ function getFocusableActiveElement(ownerDocument: Document): HTMLElement | null 
   return activeElement as HTMLElement;
 }
 
-/**
- * Narrow listener surface shared by the window and document key targets. A union of
- * `Window | Document` loses the typed keydown overloads, so the same KeyboardEvent
- * handler registers and removes on one target with one capture flag.
- */
-interface KeyListenerTarget {
-  addEventListener(type: 'keydown', listener: (event: KeyboardEvent) => void, capture: boolean): void;
-  removeEventListener(type: 'keydown', listener: (event: KeyboardEvent) => void, capture: boolean): void;
-}
-
 /** Owns the DOM and focus lifecycle of one open image preview. */
 export class ImagePreviewModal {
   private closeCurrent: (() => void) | null = null;
 
-  open(ownerDocument: Document, image: ImageAttachment): void {
+  open(ownerDocument: Document, image: ImageAttachment, keymap: Keymap): void {
     this.close();
 
     const previouslyFocusedElement = getFocusableActiveElement(ownerDocument);
@@ -49,11 +41,13 @@ export class ImagePreviewModal {
     });
     closeButton.setText('\u00D7');
 
+    // A modal scope takes precedence over the view scope in Obsidian's window-capture keymap.
+    const scope = new Scope();
     let isClosed = false;
     const close = () => {
       if (isClosed) return;
       isClosed = true;
-      keyTarget.removeEventListener('keydown', handleKeyDown, true);
+      keymap.popScope(scope);
       overlay.remove();
       if (this.closeCurrent === close) {
         this.closeCurrent = null;
@@ -62,24 +56,20 @@ export class ImagePreviewModal {
         previouslyFocusedElement.focus();
       }
     };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        event.stopPropagation();
-        close();
-      } else if (event.key === 'Tab') {
-        event.preventDefault();
-        closeButton.focus();
-      }
-    };
+    scope.register(null, 'Escape', () => {
+      close();
+      return false;
+    });
+    scope.register(null, 'Tab', () => {
+      closeButton.focus();
+      return false;
+    });
 
     closeButton.addEventListener('click', close);
     overlay.addEventListener('click', (event) => {
       if (event.target === overlay) close();
     });
-    // Window capture runs ahead of Obsidian's keymap, whose view scope cancels a running turn on Escape.
-    const keyTarget: KeyListenerTarget = ownerDocument.defaultView ?? ownerDocument;
-    keyTarget.addEventListener('keydown', handleKeyDown, true);
+    keymap.pushScope(scope);
     this.closeCurrent = close;
     closeButton.focus();
   }

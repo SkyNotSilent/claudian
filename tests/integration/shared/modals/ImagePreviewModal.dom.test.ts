@@ -8,7 +8,7 @@ import { FakeSideBackend, type FakeSideSession } from '@test/helpers/features/ch
 import { testDate } from '@test/helpers/testClock';
 import { fireEvent, waitFor, within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
-import { App, Component } from 'obsidian';
+import { App, Component, type Scope } from 'obsidian';
 
 import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
@@ -47,6 +47,14 @@ async function createView() {
   const backend = new FakeSideBackend();
   jest.spyOn(ProviderRegistry, 'createExecutionBackend').mockReturnValue(backend);
   const app = new App();
+  const scopes: Scope[] = [];
+  Object.assign(app, { keymap: {
+    pushScope: (scope: Scope) => { scopes.push(scope); },
+    popScope: (scope: Scope) => {
+      const index = scopes.indexOf(scope);
+      if (index >= 0) scopes.splice(index, 1);
+    },
+  } });
   Object.assign(app.vault.adapter, { basePath: '/vault' });
   Object.assign(app.vault, { on: () => ({}), offref() {} });
   Object.assign(app.workspace, { getActiveViewOfType: () => null, getActiveFile: () => null, on: () => ({}), offref() {} });
@@ -108,7 +116,7 @@ async function createView() {
   const root = createClaudianView({ host: plugin, containerEl: tab.dom.contentEl,
     contentEl: tab.dom.contentEl, tabManager: { getActiveTab: () => tab } });
   root.wireEventHandlers();
-  return { get tab() { return tab; }, backend, saved, conversation, plugin, root,
+  return { get tab() { return tab; }, backend, saved, conversation, plugin, root, scopes,
     dispose: async () => { await destroyTab(tab); await pool.dispose(); await lifecycle.dispose(); } };
 }
 
@@ -116,17 +124,32 @@ type View = Awaited<ReturnType<typeof createView>>;
 
 /** External Obsidian keymap stand-in: delivers real DOM events to the actual registered Scope. */
 function installHostKeymap(view: View): { deliveries: number[]; remove: () => void } {
-  const handler = view.root.scope.handlers.find((entry: { key: string }) => entry.key === 'Escape');
   const deliveries: number[] = [];
   const deliver = (event: KeyboardEvent) => {
-    // Obsidian delivers an event to a Scope handler only when its key matches the registered key.
-    if (event.key !== handler.key) return;
-    deliveries.push(1);
-    // Obsidian consumes a false-returning Scope handler before the same event reaches the DOM.
-    if (handler.func(event) === false) event.preventDefault();
+    // Obsidian installs this listener on window capture before any preview is opened.
+    const scope = view.scopes.at(-1) ?? view.root.scope;
+    const handlers = (scope as unknown as { handlers: Array<{
+      key: string | null;
+      modifiers: string[] | null;
+      func: (event: KeyboardEvent) => unknown;
+    }> }).handlers;
+    const modifiers = [
+      ...(event.ctrlKey ? ['Ctrl'] : []), ...(event.metaKey ? ['Meta'] : []),
+      ...(event.altKey ? ['Alt'] : []), ...(event.shiftKey ? ['Shift'] : []),
+    ];
+    const handler = handlers.find(entry => entry.key === event.key && (
+      entry.modifiers === null || (entry.modifiers.length === modifiers.length &&
+        entry.modifiers.every(modifier => modifiers.includes(modifier)))
+    ));
+    if (!handler) return;
+    if (scope === view.root.scope) deliveries.push(1);
+    if (handler.func(event) === false) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
   };
-  document.addEventListener('keydown', deliver, true);
-  return { deliveries, remove: () => document.removeEventListener('keydown', deliver, true) };
+  window.addEventListener('keydown', deliver, true);
+  return { deliveries, remove: () => window.removeEventListener('keydown', deliver, true) };
 }
 
 function textbox(view: View): HTMLElement { return within(view.tab.dom.inputEl).getByRole('textbox'); }
@@ -170,58 +193,58 @@ interface ActiveWork {
 }
 
 async function startSelectedMainWork(view: View): Promise<ActiveWork> {
-      type(view, 'Running prompt');
-      const pending = view.tab.controllers.inputController.sendMessage();
-      await waitFor(() => expect(view.backend.latest.getStatus()).toBe('executing'));
-      const session = view.backend.latest;
-      return {
-        session, pending,
-        assertWorking: () => {
-          expect(view.tab.state.isStreaming).toBe(true);
-          expect(session.getStatus()).toBe('executing');
-        },
-      };
+  type(view, 'Running prompt');
+  const pending = view.tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(view.backend.latest.getStatus()).toBe('executing'));
+  const session = view.backend.latest;
+  return {
+    session, pending,
+    assertWorking: () => {
+      expect(view.tab.state.isStreaming).toBe(true);
+      expect(session.getStatus()).toBe('executing');
+    },
+  };
 }
 
 async function startSelectedSideWork(view: View): Promise<ActiveWork> {
-      type(view, 'Parent prompt');
-      const parentTurn = view.tab.controllers.inputController.sendMessage();
-      await waitFor(() => expect(view.backend.latest.getStatus()).toBe('executing'));
-      const parent = view.backend.latest;
-      parent.emitText('Parent answer');
-      parent.complete();
-      await parentTurn;
-      type(view, '/side Independent child prompt');
-      const pending = view.tab.controllers.inputController.sendMessage();
-      await waitFor(() => expect(view.backend.sessions).toHaveLength(2));
-      const session = view.backend.sessions[1];
-      await waitFor(() => expect(session.getStatus()).toBe('executing'));
+  type(view, 'Parent prompt');
+  const parentTurn = view.tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(view.backend.latest.getStatus()).toBe('executing'));
+  const parent = view.backend.latest;
+  parent.emitText('Parent answer');
+  parent.complete();
+  await parentTurn;
+  type(view, '/side Independent child prompt');
+  const pending = view.tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(view.backend.sessions).toHaveLength(2));
+  const session = view.backend.sessions[1];
+  await waitFor(() => expect(session.getStatus()).toBe('executing'));
+  expect(view.tab.controllers.sideChatController.destination).toBe('side');
+  return {
+    session, pending,
+    assertWorking: () => {
       expect(view.tab.controllers.sideChatController.destination).toBe('side');
-      return {
-        session, pending,
-        assertWorking: () => {
-          expect(view.tab.controllers.sideChatController.destination).toBe('side');
-          expect(session.getStatus()).toBe('executing');
-        },
-      };
+      expect(session.getStatus()).toBe('executing');
+    },
+  };
 }
 
 async function startMainBackgroundWork(view: View): Promise<ActiveWork> {
-      type(view, 'Running prompt');
-      const sent = view.tab.controllers.inputController.sendMessage();
-      await waitFor(() => expect(view.backend.latest.getStatus()).toBe('executing'));
-      const session = view.backend.latest;
-      session.emitText('Completed answer');
-      session.complete();
-      await sent;
-      session.emitBackgroundEvent({ type: 'background_turn_started' });
-      await waitFor(() => expect(view.tab.session.hasMainBackgroundWork).toBe(true));
-      return {
-        session, pending: undefined,
-        assertWorking: () => {
-          expect(view.tab.session.hasMainBackgroundWork).toBe(true);
-        },
-      };
+  type(view, 'Running prompt');
+  const sent = view.tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(view.backend.latest.getStatus()).toBe('executing'));
+  const session = view.backend.latest;
+  session.emitText('Completed answer');
+  session.complete();
+  await sent;
+  session.emitBackgroundEvent({ type: 'background_turn_started' });
+  await waitFor(() => expect(view.tab.session.hasMainBackgroundWork).toBe(true));
+  return {
+    session, pending: undefined,
+    assertWorking: () => {
+      expect(view.tab.session.hasMainBackgroundWork).toBe(true);
+    },
+  };
 }
 
 const workScenarios: Array<{ title: string; start(view: View): Promise<ActiveWork> }> = [
@@ -247,9 +270,9 @@ it.each(workScenarios)(
 
       const escape = pressEscape(closeButton);
 
+      expect(work.session.cancelCalls).toBe(0);
       expect(within(document.body).queryByRole('dialog', { name: 'Image preview: pixel.png' })).toBeNull();
       expect(document.activeElement).toBe(trigger);
-      expect(work.session.cancelCalls).toBe(0);
       work.assertWorking();
       expect(host.deliveries).toHaveLength(0);
       expect(escape.defaultPrevented).toBe(true);
@@ -270,6 +293,25 @@ it.each(workScenarios)(
     }
   },
 );
+
+it.each(['close button', 'backdrop'] as const)('releases the preview scope after dismissal by %s', async method => {
+  const view = await createView();
+  const host = installHostKeymap(view);
+  try {
+    const trigger = renderMessageImage(view);
+    const dialog = openPreview(trigger);
+    fireEvent.click(method === 'close button'
+      ? within(dialog).getByRole('button', { name: 'Close image preview' })
+      : dialog.parentElement!);
+    expect(within(document.body).queryByRole('dialog', { name: 'Image preview: pixel.png' })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    pressEscape(trigger);
+    expect(host.deliveries).toHaveLength(1);
+  } finally {
+    host.remove();
+    await view.dispose();
+  }
+});
 
 it('opens from the composer attachment action and closes with its owner on destroy', async () => {
   const view = await createView();
@@ -333,7 +375,7 @@ it('contains Tab and Shift+Tab on its single named close control', async () => {
   }
 });
 
-it('replaces an open preview and releases the replaced dialog listener', async () => {
+it('replaces an open preview and releases the replaced dialog scope', async () => {
   const view = await createView();
   const host = installHostKeymap(view);
   try {
@@ -355,8 +397,8 @@ it('replaces an open preview and releases the replaced dialog listener', async (
     // restore, so the replacement captured the first trigger its predecessor had just restored.
     expect(document.activeElement).toBe(first);
 
-    // The replacement released the old preview's listener together with its dialog; the next Escape
-    // leaves no preview listener and reaches the host keymap from the restored first trigger.
+    // The replacement released the old preview's scope together with its dialog; the next Escape
+    // leaves no preview scope and reaches the host keymap from the restored first trigger.
     pressEscape(first);
     expect(host.deliveries).toHaveLength(1);
   } finally {
@@ -365,7 +407,7 @@ it('replaces an open preview and releases the replaced dialog listener', async (
   }
 });
 
-it('skips restoring focus to a removed trigger and still releases its listener', async () => {
+it('skips restoring focus to a removed trigger and still releases its scope', async () => {
   const view = await createView();
   const host = installHostKeymap(view);
   try {
@@ -387,7 +429,7 @@ it('skips restoring focus to a removed trigger and still releases its listener',
   }
 });
 
-it('closes the preview and releases its listener when the renderer is disposed', async () => {
+it('closes the preview and releases its scope when the renderer is disposed', async () => {
   const view = await createView();
   const host = installHostKeymap(view);
   try {
