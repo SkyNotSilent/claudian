@@ -20,6 +20,7 @@ import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import type { Conversation, SessionMetadata, SubagentInfo } from '@/core/types';
+import { organizeSessionList } from '@/features/chat/session-manager/SessionListOrganizer';
 import { ClaudeExecutionBackend } from '@/providers/claude/execution/ClaudeExecutionBackend';
 import { encodeVaultPathForSDK } from '@/providers/claude/history/ClaudeHistoryPathResolver';
 
@@ -585,6 +586,29 @@ test('migration retains assigned metadata and respects the scope of old deletion
   });
 });
 
+test('assignment recovery retains its valid source until the existing device target is readable', async () => {
+  const source = `${SESSIONS_PATH}/${metadata.id}.meta.json`;
+  const target = `${DEVICE_PATH}/${metadata.id}.meta.json`;
+  const marker = `${SESSIONS_PATH}/${metadata.id}.assigned.json`;
+  await store.saveMetadata(metadata, 'unscoped');
+  await adapter.write(target, '{');
+  await adapter.write(marker, JSON.stringify({ schemaVersion: 1, conversationId: metadata.id, deviceKey: DEVICE_KEY }));
+  await adapter.write(CLAUDIAN_SETTINGS_PATH, JSON.stringify({ userName: 'Example' }));
+
+  await new SharedStorageService({ app } as Plugin, DEFAULT_CLAUDIAN_SETTINGS).initialize();
+
+  expect(await adapter.read(source)).toBe(JSON.stringify(metadata));
+  expect(await adapter.read(target)).toBe('{');
+  expect(await adapter.exists(marker)).toBe(true);
+
+  const repaired = { ...metadata, title: 'Repaired device record' };
+  await adapter.write(target, JSON.stringify(repaired));
+  await new SharedStorageService({ app } as Plugin, DEFAULT_CLAUDIAN_SETTINGS).initialize();
+  expect(await adapter.exists(source)).toBe(false);
+  expect(await adapter.exists(marker)).toBe(false);
+  expect(await store.metadataReader.load(metadata.id)).toMatchObject({ source: 'device', metadata: repaired });
+});
+
 test.each(['{', JSON.stringify({ schemaVersion: 1, conversationId: metadata.id, deviceKey: '../invalid' })])(
   'migration retains unassigned metadata when its obsolete assignment is invalid: %s', async (content) => {
     await store.saveMetadata(metadata, 'unscoped');
@@ -723,3 +747,21 @@ test.each(['list', 'read', 'rename'] as const)(
     expect(JSON.parse(await adapter.read(`${DEVICE_PATH}/${metadata.id}.meta.json`))).toEqual(metadata);
   },
 );
+
+
+test.each([null, 42, {}, [], undefined])('leaves a malformed title record untouched and keeps the session list usable (%p)', async title => {
+  const invalid = { ...metadata, id: 'zz-bad-title', title };
+  const invalidPath = `${DEVICE_PATH}/${invalid.id}.meta.json`;
+  await store.saveMetadata(metadata);
+  await adapter.write(invalidPath, JSON.stringify(invalid));
+  const before = await adapter.read(invalidPath);
+  const scan = await store.metadataReader.scanMetadata();
+  const repository = createRepository();
+  repository.mergeMetadataConversations(scan.metadata.map(record => ({
+    ...record, providerId: record.providerId ?? 'claude', messages: [], sessionId: null,
+  })));
+  const sections = organizeSessionList(repository.list(), { organization: 'list', sort: 'last-updated', language: 'en' });
+  expect(sections[0].conversations.map(record => record.id)).toEqual([metadata.id]);
+  expect(scan).toMatchObject({ complete: true, invalidMetadataCount: 1 });
+  expect(await adapter.read(invalidPath)).toBe(before);
+});

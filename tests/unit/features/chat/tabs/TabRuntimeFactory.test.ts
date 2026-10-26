@@ -354,6 +354,11 @@ function createEventContext(
   };
 }
 
+function browseProvider(tab: { dom: { inputWrapper: HTMLElement } }, providerId: string): void {
+  const tabs = Array.from(tab.dom.inputWrapper.querySelectorAll('.claudian-model-provider-tab')) as HTMLElement[];
+  tabs.find(item => item.dataset.provider === providerId)?.click();
+}
+
 describe('Tab provider execution ownership', () => {
   const originalResizeObserver = globalThis.ResizeObserver;
 
@@ -1647,6 +1652,8 @@ describe('Tab provider execution ownership', () => {
       const tab = await createTestTab({ plugin, containerEl: createMockEl() as any }, {
         onProviderChanged,
       });
+      // A new session shows one provider's models at a time; browse to Codex first.
+      browseProvider(tab, 'codex');
       const modelOptions = Array.from(
         tab.dom.inputWrapper.querySelectorAll(
           '.claudian-model-option',
@@ -1742,6 +1749,8 @@ describe('Tab provider execution ownership', () => {
       const tab = await createTestTab({ plugin, containerEl: createMockEl() as any }, {
         onProviderChanged: () => codexSwitch,
       });
+      // A new session shows one provider's models at a time; browse to Codex first.
+      browseProvider(tab, 'codex');
       const modelOptions = Array.from(
         tab.dom.inputWrapper.querySelectorAll(
           '.claudian-model-option',

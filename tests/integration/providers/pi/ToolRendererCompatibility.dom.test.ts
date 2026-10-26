@@ -9,7 +9,7 @@ import { runtimeHostFor } from '@test/helpers/providerRuntimeHost';
 import { testDate } from '@test/helpers/testClock';
 import { fireEvent, within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
-import { Component } from 'obsidian';
+import { Component, MarkdownRenderer } from 'obsidian';
 
 import { getToolIcon } from '@/core/tools/toolIcons';
 import type { ChatMessage, ToolCallInfo } from '@/core/types';
@@ -118,6 +118,32 @@ function restoreHistory(call: NativeToolCall): ToolCallInfo {
   expect(message.toolCalls).toHaveLength(1);
   return message.toolCalls![0];
 }
+
+it.each([
+  { name: 'an empty text block', content: [{ type: 'text', text: '' }], expectedImages: undefined },
+  { name: 'an empty content array', content: [], expectedImages: undefined },
+  { name: 'an image-only result', content: [{ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }], expectedImages: [{ kind: 'data', mediaType: 'image/png', data: 'aGVsbG8=' }] },
+])('replaces live progress with $name at native completion', async ({ content, expectedImages }) => {
+  const normalization = createPiEventNormalizationState();
+  const { stream, response, messages, close } = createChatStream();
+  const send = async (event: Record<string, unknown>) => {
+    for (const chunk of normalizePiRPCEvent(event, normalization)) await stream.handleStreamChunk(chunk, response);
+  };
+  try {
+    await send({ type: 'tool_execution_start', toolCallId: 'tool', toolName: 'preview', args: {} });
+    await send({ type: 'tool_execution_update', toolCallId: 'tool', toolName: 'preview',
+      partialResult: { content: [{ type: 'text', text: 'Temporary progress' }] } });
+    expect(response.toolCalls?.[0].result).toBe('Temporary progress');
+    await send({ type: 'tool_execution_end', toolCallId: 'tool', toolName: 'preview', isError: false,
+      result: { content, details: {} } });
+    expect(response.toolCalls?.[0]).toMatchObject({ status: 'completed', result: '' });
+    expect(messages.textContent).not.toContain('Temporary progress');
+    expect(response.toolCalls?.[0].resultImages).toEqual(expectedImages);
+    expect((await axe(messages)).violations).toEqual([]);
+  } finally {
+    close();
+  }
+});
 
 const restore = (mode: 'live' | 'history', call: NativeToolCall) => mode === 'live'
   ? restoreLive(call)
@@ -453,4 +479,20 @@ it('streams a running script\'s nested calls through the Pi session and refreshe
     await session.dispose();
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+it('presents a native Pi retry as a warning rather than a blocked action', async () => {
+  const { stream, response, messages, close } = createChatStream();
+  const render = jest.spyOn(MarkdownRenderer, 'render').mockImplementation(async (_app, markdown, element) => { element.textContent = markdown; });
+  try {
+    const state = createPiEventNormalizationState();
+    for (const chunk of normalizePiRPCEvent({ type: 'auto_retry_start' }, state)) {
+      await stream.handleStreamChunk(chunk, response);
+    }
+    await stream.finalizeCurrentTextBlock(response);
+    expect(response.contentBlocks).toContainEqual({ type: 'text', content: '\n\n⚠️ **Warning:** Pi is retrying the turn.' });
+    expect(messages.textContent).toContain('Pi is retrying the turn.');
+    expect(messages.textContent).not.toContain('Blocked:');
+    expect((await axe(messages)).violations).toEqual([]);
+  } finally { render.mockRestore(); close(); }
 });

@@ -22,7 +22,7 @@ function normalizePosixPath(value: string): string {
     return '';
   }
 
-  const normalized = path.posix.normalize(value.replace(/\\/g, '/'));
+  const normalized = path.posix.normalize(value.startsWith('/') ? value : value.replace(/\\/g, '/'));
   return normalized === '/' ? normalized : normalized.replace(/\/+$/, '');
 }
 
@@ -40,7 +40,7 @@ function maybeMapWindowsDriveToWsl(hostPath: string): string | null {
 
 function maybeMapWslUncToLinux(hostPath: string, distroName?: string): string | null {
   const normalized = normalizeWindowsPath(hostPath);
-  const match = normalized.match(/^\\\\wsl\$\\([^\\]+)(?:\\(.*))?$/i);
+  const match = normalized.match(/^\\\\(?:wsl\$|wsl\.localhost)\\([^\\]+)(?:\\(.*))?$/i);
   if (!match) {
     return null;
   }

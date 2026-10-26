@@ -27,7 +27,8 @@ function isAbsolutePath(value: string): boolean {
 }
 
 function isWindowsPath(value: string): boolean {
-  return value.includes('\\') || /^[A-Za-z]:/.test(value);
+  return (!path.posix.isAbsolute(value) || value.startsWith('//'))
+    && (value.includes('\\') || /^[A-Za-z]:/.test(value));
 }
 
 function joinSessionsRoot(home: string): string {
@@ -40,7 +41,7 @@ function joinSessionsRoot(home: string): string {
 function parseStandardWslSessionsRoot(value: string): WslSessionsRoot | null {
   const normalized = path.win32.normalize(value);
   const match = normalized.match(
-    /^(\\\\wsl\$\\([^\\]+)\\home\\[^\\]+\\\.codex\\sessions)(?:\\|$)/i,
+    /^(\\\\(?:wsl\$|wsl\.localhost)\\([^\\]+)\\home\\[^\\]+\\\.codex\\sessions)(?:\\|$)/i,
   );
   return match ? { distroName: match[2], root: match[1] } : null;
 }
@@ -102,7 +103,7 @@ function getTrustedSessionRoots(
         path.posix.join(configuredHome, 'sessions'),
       );
       if (hostSessionsRoot) {
-        roots.push(hostSessionsRoot);
+        roots.push(hostSessionsRoot, hostSessionsRoot.replace(/^(\\\\)wsl\$(\\)/i, '$1wsl.localhost$2'));
       }
     }
   }

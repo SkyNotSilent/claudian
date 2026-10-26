@@ -64,6 +64,21 @@ describe('ClaudeCommandRepository', () => {
     expect(result.commands[2].revision).toMatch(/^[a-f0-9]{64}$/);
   });
 
+  it('preserves metadata when editing a UTF-8 BOM command', async () => {
+    addCommand('review.md', `\uFEFF${REVIEW_COMMAND}`);
+    const repository = new ClaudeCommandRepository(files);
+    const [loaded] = (await repository.list()).commands;
+
+    expect(loaded.description).toBe('Review a change');
+    expect(loaded.instructions).toBe('Review $ARGUMENTS carefully.');
+    await repository.update(loaded.name, loaded.revision, {
+      name: loaded.name, description: 'Edited', instructions: 'Updated body',
+    });
+    const [reloaded] = (await repository.list()).commands;
+    expect(reloaded.frontmatter).toMatchObject({ 'argument-hint': '[file]', 'allowed-tools': ['Read', 'Grep'] });
+    expect(reloaded.instructions).toBe('Updated body');
+  });
+
   it('keeps unedited frontmatter under the preserve policy', async () => {
     await addCommand('review.md', REVIEW_COMMAND);
     const repository = new ClaudeCommandRepository(files);
@@ -271,15 +286,33 @@ describe('ClaudeCommandRepository', () => {
 
     const readFailure = new ClaudeCommandRepository({
       verifyManagedPath: jest.fn().mockResolvedValue(true),
-      listManagedFolder: jest.fn().mockResolvedValue({
-        files: [`${CLAUDE_COMMANDS_ROOT}/broken.md`],
-        folders: [],
-      }),
+      listManagedFolderEntries: jest.fn().mockResolvedValue([
+        { path: `${CLAUDE_COMMANDS_ROOT}/broken.md`, type: 'file' },
+      ]),
       readManagedFile: jest.fn().mockRejectedValue(new Error('unreadable')),
     } as unknown as VaultFileAdapter);
     await expect(readFailure.list()).resolves.toEqual({
       commands: [],
       diagnostics: [{ directoryPath: `${CLAUDE_COMMANDS_ROOT}/broken.md`, message: 'unreadable' }],
     });
+  });
+});
+
+describe('ClaudeCommandRepository desktop listing', () => {
+  it('keeps readable commands when a sibling link is dangling', async () => {
+    const vault = await DesktopVault.create();
+    try {
+      await vault.write(`${CLAUDE_COMMANDS_ROOT}/good.md`, 'Good command.\n');
+      await vault.write(`${CLAUDE_COMMANDS_ROOT}/nested/other.md`, 'Nested command.\n');
+      await vault.symlink(`${CLAUDE_COMMANDS_ROOT}/broken`, vault.resolve('missing-target'));
+      const result = await new ClaudeCommandRepository(vault.files).list();
+
+      expect(result.commands.map(command => command.name)).toEqual(['good', 'nested/other']);
+      expect(result.diagnostics).toEqual([expect.objectContaining({
+        directoryPath: `${CLAUDE_COMMANDS_ROOT}/broken`,
+      })]);
+      expect(await vault.readlink(`${CLAUDE_COMMANDS_ROOT}/broken`)).toBe(vault.resolve('missing-target'));
+      expect(await vault.read(`${CLAUDE_COMMANDS_ROOT}/good.md`)).toBe('Good command.\n');
+    } finally { await vault.dispose(); }
   });
 });
