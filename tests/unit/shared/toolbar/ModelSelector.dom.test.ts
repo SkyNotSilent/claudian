@@ -25,6 +25,32 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 
+it('keeps keyboard focus on the selected model when aliases share a label', async () => {
+  const host = document.body.createDiv();
+  const settings = {
+    model: 'haiku',
+    providerConfigs: { claude: {
+      discoveredModels: ['haiku', 'sonnet'].map(value => ({ value, label: value, description: '' })),
+      visibleModels: ['haiku', 'sonnet'],
+      modelAliases: { haiku: 'Shared alias', sonnet: 'Shared alias' },
+    } },
+  };
+  new ModelSelector(host, {
+    getSettings: () => settings,
+    getUIConfig: () => claudeChatUIConfig,
+    onModelChange: async (model: string) => { settings.model = model; },
+  } as unknown as ToolbarCallbacks);
+  fireEvent.click(within(host).getByRole('button', { name: 'Model: Shared alias' }));
+  expect((await axe(host)).violations).toEqual([]);
+  const second = within(host).getAllByRole('option', { name: 'Shared alias' })[1];
+  second.focus();
+  fireEvent.click(second);
+  await waitFor(() => expect(settings.model).toBe('sonnet'));
+  await waitFor(() => expect(document.activeElement).toBe(within(host).getByRole('option', { selected: true })));
+  fireEvent.keyDown(document.activeElement!, { key: 'ArrowDown' });
+  expect(document.activeElement).toBe(within(host).getAllByRole('option')[0]);
+});
+
 it.each([
   {
     name: 'discovered labels without own aliases',

@@ -89,6 +89,8 @@ interface ToolbarMenuItemOptions {
   checked: boolean;
   /** Dialog controls take one tab stop each; menu items are reached with arrow keys only. */
   tabbable?: boolean;
+  /** Stable identity used to restore focus after the items are rebuilt. */
+  key?: string;
   label: string;
   cls?: string;
   detail?: string;
@@ -163,7 +165,7 @@ export class ToolbarMenu {
         role: options.role,
         [options.role === 'option' ? 'aria-selected' : 'aria-checked']: String(options.checked),
         tabindex: options.tabbable ? '0' : '-1',
-        'data-menu-key': `${options.role}:${options.label}`,
+        'data-menu-key': options.key ?? `${options.role}:${options.label}`,
       },
     });
     if (options.providerId) itemEl.dataset.provider = options.providerId;

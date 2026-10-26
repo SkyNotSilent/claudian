@@ -150,6 +150,7 @@ export class ModelSelector {
       const selected = model.value === currentModel;
       this.menu.createItem(model.group && groupEl ? groupEl : listEl, {
         role: 'option',
+        key: `model:${model.value}`,
         checked: selected,
         // The list is one tab stop: the selected model, or the first when none is.
         tabbable: hasSelection ? selected : index === 0,
