@@ -23,7 +23,7 @@ export const opencodeModelPolicy: ProviderModelPolicy = {
   getModelOptions(settings): ProviderUIOption[] {
     const opencodeSettings = getOpencodeProviderSettings(settings);
     const applyAlias = (rawId: string, option: ProviderUIOption): ProviderUIOption => {
-      const alias = opencodeSettings.modelAliases[rawId];
+      const alias = Object.hasOwn(opencodeSettings.modelAliases, rawId) ? opencodeSettings.modelAliases[rawId] : undefined;
       return alias ? { ...option, label: alias } : option;
     };
     const discoveredModels = new Map(buildOpencodeBaseModels(opencodeSettings.discoveredModels).map((model) => [
@@ -102,7 +102,7 @@ export const opencodeModelPolicy: ProviderModelPolicy = {
     const opencodeSettings = getOpencodeProviderSettings(settingsBag);
     const baseRawId = resolveOpencodeBaseModelRawId(rawModelId, opencodeSettings.discoveredModels);
     const supportedValues = new Set(
-      (opencodeSettings.thinkingOptionsByModel[baseRawId] ?? []).map((variant) => variant.value),
+      (Object.hasOwn(opencodeSettings.thinkingOptionsByModel, baseRawId) ? opencodeSettings.thinkingOptionsByModel[baseRawId] : []).map((variant) => variant.value),
     );
     const nextPreferredThinkingByModel = {
       ...opencodeSettings.preferredThinkingByModel,
@@ -165,8 +165,8 @@ function getDefaultThinkingLevelForModel(
 ): string {
   const opencodeSettings = getOpencodeProviderSettings(settings);
   return resolveOpencodeDefaultThinkingLevel(
-    opencodeSettings.thinkingOptionsByModel[baseRawId] ?? [],
-    opencodeSettings.preferredThinkingByModel[baseRawId],
+    Object.hasOwn(opencodeSettings.thinkingOptionsByModel, baseRawId) ? opencodeSettings.thinkingOptionsByModel[baseRawId] : [],
+    Object.hasOwn(opencodeSettings.preferredThinkingByModel, baseRawId) ? opencodeSettings.preferredThinkingByModel[baseRawId] : undefined,
   );
 }
 
@@ -181,7 +181,7 @@ function getOpencodeThinkingOptions(
 
   const opencodeSettings = getOpencodeProviderSettings(settings);
   const baseRawId = resolveOpencodeBaseModelRawId(rawModelId, opencodeSettings.discoveredModels);
-  return opencodeSettings.thinkingOptionsByModel[baseRawId] ?? [];
+  return Object.hasOwn(opencodeSettings.thinkingOptionsByModel, baseRawId) ? opencodeSettings.thinkingOptionsByModel[baseRawId] : [];
 }
 
 function pushOption(
@@ -213,7 +213,7 @@ export function createOpencodeModelMetadataPreparer(
 
     const opencodeSettings = getOpencodeProviderSettings(context.plugin.settings);
     const baseRawId = resolveOpencodeBaseModelRawId(rawModelId, opencodeSettings.discoveredModels);
-    if (baseRawId && opencodeSettings.thinkingOptionsByModel[baseRawId]) {
+    if (baseRawId && Object.hasOwn(opencodeSettings.thinkingOptionsByModel, baseRawId)) {
       return;
     }
 
