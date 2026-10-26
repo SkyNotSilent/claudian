@@ -81,7 +81,7 @@ function getSelectOptions(request: Record<string, unknown>): PiSelectOption[] {
   const rawOptions = Array.isArray(request.options) ? request.options : [];
   return rawOptions.flatMap((option): PiSelectOption[] => {
     if (typeof option === 'string' && option.trim()) {
-      return [{ label: option.trim(), value: option.trim() }];
+      return [{ label: option.trim(), value: option }];
     }
     if (!option || typeof option !== 'object' || Array.isArray(option)) {
       return [];
@@ -224,7 +224,9 @@ class PiTextModal extends PiExtensionModal<{ cancelled?: boolean; value?: string
 
   protected render(): void {
     this.renderHeader(t('chat.pi.extension'));
-    const initialValue = typeof this.request.value === 'string'
+    const initialValue = this.multiline && typeof this.request.prefill === 'string'
+      ? this.request.prefill
+      : typeof this.request.value === 'string'
       ? this.request.value
       : typeof this.request.defaultValue === 'string'
       ? this.request.defaultValue
