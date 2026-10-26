@@ -27,7 +27,7 @@ function isAbsolutePath(value: string): boolean {
 }
 
 function isWindowsPath(value: string): boolean {
-  return value.includes('\\') || /^[A-Za-z]:/.test(value);
+  return !path.posix.isAbsolute(value) && (value.includes('\\') || /^[A-Za-z]:/.test(value));
 }
 
 function joinSessionsRoot(home: string): string {
