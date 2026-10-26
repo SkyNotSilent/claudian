@@ -55,6 +55,27 @@ describe('AgentSkillRepository', () => {
     return vault.write(`${AGENT_SKILLS_ROOT}/${name}/SKILL.md`, content);
   }
 
+  it.each(['strict', 'lenient'] as const)('reads and edits UTF-8 BOM skill documents under the %s policy', async readPolicy => {
+    addSkill('bom-skill', `\uFEFF${markdown('bom-skill')}`);
+    const owner = new AgentSkillRepository(vaultFiles, { readPolicy });
+
+    const initial = await owner.list();
+    expect(initial.diagnostics).toEqual([]);
+    expect(initial.skills).toHaveLength(1);
+    const [loaded] = initial.skills;
+    expect(loaded.instructions).toBe('Instructions');
+    expect(loaded.frontmatter.license).toBe('MIT');
+
+    await owner.update(loaded.name, loaded.revision, {
+      name: loaded.name, description: 'Edited', instructions: 'Updated instructions',
+    });
+    const reloaded = await owner.list();
+    expect(reloaded.diagnostics).toEqual([]);
+    expect(reloaded.skills[0]).toMatchObject({
+      description: 'Edited', instructions: 'Updated instructions', frontmatter: { license: 'MIT' },
+    });
+  });
+
   it('validates each skill file once through the safe reader', async () => {
     await addSkill('one'); await addSkill('two');
     const verify = jest.spyOn(vaultFiles, 'verifyManagedPath');
@@ -546,7 +567,9 @@ describe('AgentSkillRepository', () => {
     it('moves a broken package folder to trash', async () => {
       await vault.write(`${AGENT_SKILLS_ROOT}/broken/SKILL.md`, '---\nname: broken\n---\nBody\n');
 
-      await repository.trashBroken('broken');
+      const [diagnostic] = (await repository.list()).diagnostics;
+      expect(diagnostic.repairRevision).toBe((await repository.readForRepair('broken')).revision);
+      await repository.trashBroken('broken', diagnostic.repairRevision!);
 
       expect(vault.trashed).toEqual([`${AGENT_SKILLS_ROOT}/broken`]);
     });

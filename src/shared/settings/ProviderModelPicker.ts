@@ -3,7 +3,7 @@ import { Setting } from 'obsidian';
 import type { ProviderCatalogModel, ProviderModelCatalogSnapshot, ProviderModelSelectionChange } from '../../core/providers/models/ProviderModelCatalog';
 import { t } from '../../i18n/i18n';
 
-const ALL_PROVIDERS_KEY = 'all';
+const ALL_PROVIDERS_KEY = '';
 
 export interface ProviderModelPickerController {
   refresh(): void;
@@ -280,6 +280,7 @@ export function renderProviderModelPicker(
         if (!renderingSelected) void persistAlias(model.id, aliasInput.value);
       });
       aliasInput.addEventListener('keydown', (event) => {
+        if (event.isComposing) return;
         if (event.key === 'Enter') {
           event.preventDefault();
           aliasInput.blur();
