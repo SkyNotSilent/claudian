@@ -112,7 +112,7 @@ export const opencodeModelPolicy: ProviderModelPolicy = {
     if (!value || !supportedValues.has(value)) {
       delete nextPreferredThinkingByModel[baseRawId];
     } else {
-      nextPreferredThinkingByModel[baseRawId] = value;
+      Object.defineProperty(nextPreferredThinkingByModel, baseRawId, { value, enumerable: true, writable: true, configurable: true });
     }
 
     updateOpencodeProviderSettings(settingsBag, {

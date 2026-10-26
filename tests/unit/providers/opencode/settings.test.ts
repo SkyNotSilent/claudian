@@ -483,3 +483,13 @@ it.each([
   });
   expect(opencodeModelPolicy.getModelOptions(settings)).toEqual([expect.objectContaining({ value: 'opencode:constructor', group: 'Upstream', label })]);
 });
+
+it.each(['__proto__', 'ordinary-model'])('persists the first explicit reasoning choice for %s', id => {
+  const settings: Record<string, unknown> = {};
+  updateOpencodeProviderSettings(settings, { visibleModels: [id], discoveredModels: [{ rawId: id, label: 'Gateway model' }],
+    thinkingOptionsByModel: Object.fromEntries([[id, [{ value: 'high', label: 'High' }]]]),
+  });
+  opencodeModelPolicy.applyReasoningSelection?.('opencode:' + id, 'high', settings);
+  expect(Object.entries(getOpencodeProviderSettings(JSON.parse(JSON.stringify(settings))).preferredThinkingByModel))
+    .toEqual([[id, 'high']]);
+});
