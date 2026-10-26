@@ -40,8 +40,12 @@ export class BrowserSelectionController {
         return;
       }
 
+      const url = this.#extractViewUrl(browserView.view, browserView.containerEl);
       const selectedText = await this.extractSelectedText(browserView.containerEl);
       if (generation !== this.pollGeneration) return;
+      const active = this.#getActiveBrowserView();
+      if (active?.view !== browserView.view || active.containerEl !== browserView.containerEl
+        || this.#extractViewUrl(active.view, active.containerEl) !== url) return;
       if (selectedText) {
         const nextContext = this.#buildContext(browserView.view, browserView.viewType, browserView.containerEl, selectedText);
         if (!this.#isSameSelection(nextContext, this.storedSelection)) {
