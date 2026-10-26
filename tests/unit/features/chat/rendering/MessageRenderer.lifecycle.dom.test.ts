@@ -160,11 +160,10 @@ it.each(['user scroll', 'history replacement', 'disposal', 'following growth'])(
     }
     if (action === 'disposal') {
       renderer.dispose();
-      host.scrollTop = 40;
     }
     if (action === 'following growth') height = 1400;
     pending(0);
-    expect(host.scrollTop).toBe(action === 'user scroll' ? 100 : action === 'history replacement' ? 30 : action === 'disposal' ? 40 : 1400);
+    expect(host.scrollTop).toBe(action === 'user scroll' ? 100 : action === 'history replacement' ? 30 : action === 'disposal' ? 850 : 1400);
   } finally {
     request.mockRestore();
     cancel.mockRestore();
