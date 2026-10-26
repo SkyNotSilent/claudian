@@ -2,7 +2,7 @@
 import '@/providers';
 import '@test/helpers/ObsidianSettingsDOM';
 
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -199,10 +199,18 @@ describe('DeepSeekSettingsTab', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.each(['desktop', 'cmd', 'ps1'] as const)('inspects Windows %s through its native Node entry without spawning a command shim', async kind => {
+  it.each([
+    ['desktop', false], ['cmd', false], ['ps1', false], ['desktop', true],
+  ] as const)('inspects Windows %s through its native Node entry without spawning a command shim (directory alias: %s)', async (kind, useAlias) => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
     const root = mkdtempSync(join(tmpdir(), 'deepseek windows probe '));
-    const install = join(root, 'Desktop');
+    const fixtureRoot = useAlias ? join(root, 'alias') : root;
+    if (useAlias) {
+      const target = join(root, 'native');
+      mkdirSync(target);
+      symlinkSync(target, fixtureRoot, 'junction');
+    }
+    const install = join(fixtureRoot, 'Desktop');
     const resources = join(install, 'resources');
     const packageRoot = kind === 'desktop' ? join(resources, 'app.asar/dsh/node_modules/@deepseek-ai/dsh') : join(root, 'node_modules/@deepseek-ai/dsh');
     const bin = join(packageRoot, 'lib/bin.js');
@@ -227,9 +235,11 @@ describe('DeepSeekSettingsTab', () => {
       const [spec] = probe.mock.calls[0];
       expect(spec.command).not.toBe(command);
       expect(spec.directSpawn).toBe(true);
-      expect(spec.args).toEqual([...(kind === 'desktop' ? ['--expose-internals'] : []), bin, '--version']);
+      // Desktop discovery resolves directory aliases, including macOS's temporary directory.
+      const entry = kind === 'desktop' ? realpathSync(bin) : bin;
+      expect(spec.args).toEqual([...(kind === 'desktop' ? ['--expose-internals'] : []), entry, '--version']);
       const nodeCommand = expect.stringMatching(/node(?:\.exe)?$/);
-      expect(spec.command).toEqual(kind === 'desktop' ? executable : nodeCommand);
+      expect(spec.command).toEqual(kind === 'desktop' ? realpathSync(executable) : nodeCommand);
       expect(spec.env.ELECTRON_RUN_AS_NODE).toBe(kind === 'desktop' ? '1' : process.env.ELECTRON_RUN_AS_NODE);
     } finally {
       Object.defineProperty(process, 'platform', platform);
