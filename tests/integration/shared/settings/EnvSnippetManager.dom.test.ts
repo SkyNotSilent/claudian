@@ -6,9 +6,11 @@ import { fireEvent, waitFor, within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
 import { Notice } from 'obsidian';
 
+import { ClaudianSettingsStorage } from '@/app/settings/ClaudianSettingsStorage';
 import { DEFAULT_CLAUDIAN_SETTINGS } from '@/app/settings/defaultSettings';
 import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
 import type { ProviderHost } from '@/core/providers/ProviderHost';
+import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import { getClaudeProviderSettings, updateClaudeProviderSettings } from '@/providers/claude/settings';
 import { EnvSnippetManager, EnvSnippetModal } from '@/shared/settings/EnvSnippetManager';
 
@@ -65,6 +67,35 @@ function notifyCalls(notice: jest.Mock): string[] {
 }
 
 const aliasCases: Array<Record<string, string> | undefined> = [undefined, {}, { custom: ' Snippet name ' }];
+
+it('preserves own context-limit keys when inserting a snippet with production object-spread semantics', async () => {
+  const settings = JSON.parse(JSON.stringify(DEFAULT_CLAUDIAN_SETTINGS)) as typeof DEFAULT_CLAUDIAN_SETTINGS;
+  settings.customContextLimits = { sibling: 256000 };
+  settings.envSnippets = [{
+    id: 'snippet', name: 'Custom limits', description: '', scope: 'provider:claude',
+    envVars: 'ANTHROPIC_MODEL=custom',
+    contextLimits: JSON.parse('{"__proto__":64000,"custom":128000}') as Record<string, number>,
+  }];
+  const coordinator = new SettingsCoordinator(settings, async () => undefined);
+  const host = {
+    settings,
+    app: { workspace: { getLeavesOfType: () => [] } },
+    applyEnvironmentVariables: async () => undefined,
+    mutateSettings: coordinator.mutate.bind(coordinator),
+  } as unknown as ProviderHost;
+  const container = document.body.createEl('main');
+  const changed = jest.fn();
+  new EnvSnippetManager(container, host, 'provider:claude', changed);
+
+  fireEvent.click(within(container).getByRole('button', { name: 'Insert' }));
+  await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+
+  expect(Object.getOwnPropertyDescriptor(settings.customContextLimits, '__proto__')?.value).toBe(64000);
+  expect(JSON.parse(JSON.stringify(settings.customContextLimits))).toEqual(
+    JSON.parse('{"sibling":256000,"__proto__":64000,"custom":128000}'),
+  );
+  expect(await axe(container)).toHaveNoViolations();
+});
 
 it.each(aliasCases)('applies snippet aliases through provider settings while preserving unrelated aliases (%p)', async modelAliases => {
   const settings = JSON.parse(JSON.stringify(DEFAULT_CLAUDIAN_SETTINGS)) as typeof DEFAULT_CLAUDIAN_SETTINGS;
@@ -472,4 +503,80 @@ it.each(['', '   '])('clears a context override (%p) through the coordinator whi
   expect(within(container).getByText('Renamed snippet name')).toBeTruthy();
   expect(within(container).queryByText('Existing snippet name')).toBeNull();
   expect(notifyCalls(notice)).not.toContain('Could not complete environment snippet update');
+});
+
+
+it('saves, reloads and inserts snippet overrides for prototype-named custom models', async () => {
+  const settings = structuredClone(DEFAULT_CLAUDIAN_SETTINGS);
+  settings.envSnippets = [];
+  const envVars = 'ANTHROPIC_MODEL=__proto__\nANTHROPIC_DEFAULT_SONNET_MODEL=constructor';
+  let persisted = '';
+  const adapter = {
+    exists: async () => persisted !== '',
+    read: async () => persisted,
+    write: async (_path: string, content: string) => { persisted = content; },
+  } as unknown as VaultFileAdapter;
+  const storage = new ClaudianSettingsStorage(adapter, DEFAULT_CLAUDIAN_SETTINGS);
+  const coordinator = new SettingsCoordinator(settings, value => storage.save(value));
+  const onChanged = jest.fn();
+  const host = {
+    settings, mutateSettings: coordinator.mutate.bind(coordinator),
+    app: { workspace: { getLeavesOfType: () => [] } },
+    getEnvironmentVariablesForScope: () => envVars,
+    applyEnvironmentVariables: async () => undefined,
+  } as unknown as ProviderHost;
+  const container = document.body.createEl('main');
+  new EnvSnippetManager(container, host, 'provider:claude', onChanged);
+  const joinFocusTimers = captureModalFocusTimers(() => {
+    fireEvent.click(within(container).getByRole('button', { name: 'Save current environment as a snippet' }));
+  });
+  await joinFocusTimers();
+  const dialog = within(document.body).getByRole('dialog', { name: 'Save snippet' });
+  const fields = within(dialog);
+  const name = within(fields.getByText('Name').parentElement!).getByRole('textbox');
+  fireEvent.input(name, { target: { value: 'Special model endpoint' } });
+  for (const [modelId, alias, limit] of [
+    ['__proto__', 'Prototype model', '200k'],
+    ['constructor', 'Constructor model', '100k'],
+  ]) {
+    const aliasInput = fields.getByRole<HTMLInputElement>('textbox', { name: `Alias for ${modelId}` });
+    const limitInput = fields.getByRole<HTMLInputElement>('textbox', { name: `Context window for ${modelId}` });
+    expect(aliasInput.value).toBe('');
+    expect(limitInput.value).toBe('');
+    fireEvent.input(aliasInput, { target: { value: alias } });
+    fireEvent.input(limitInput, { target: { value: limit } });
+  }
+  const overrideRow = fields.getByRole('textbox', { name: 'Alias for __proto__' }).parentElement!;
+  expect(await axe(overrideRow)).toHaveNoViolations();
+  fireEvent.click(fields.getByRole('button', { name: 'Save' }));
+  await waitFor(() => expect(within(container).getByText('Special model endpoint')).toBeTruthy());
+  const expectedAliases = Object.fromEntries([['__proto__', 'Prototype model'], ['constructor', 'Constructor model']]);
+  const expectedLimits = Object.fromEntries([['__proto__', 200000], ['constructor', 100000]]);
+  expect(settings.envSnippets[0]).toMatchObject({ modelAliases: expectedAliases, contextLimits: expectedLimits });
+  const reloaded = await storage.load();
+  expect(reloaded.envSnippets[0]).toMatchObject({ modelAliases: expectedAliases, contextLimits: expectedLimits });
+  // Rebuild the real manager against decoded data, then run its Insert action.
+  Object.assign(settings, reloaded);
+  container.replaceChildren();
+  new EnvSnippetManager(container, host, 'provider:claude', onChanged);
+  fireEvent.click(within(container).getByRole('button', { name: 'Insert' }));
+  await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  expect(getClaudeProviderSettings(settings).modelAliases).toEqual(expectedAliases);
+
+  const joinEditFocus = captureModalFocusTimers(() => {
+    fireEvent.click(within(container).getByRole('button', { name: 'Edit' }));
+  });
+  await joinEditFocus();
+  const edit = within(within(document.body).getByRole('dialog', { name: 'Edit snippet' }));
+  for (const [modelId, alias] of Object.entries(expectedAliases)) {
+    const input = edit.getByRole<HTMLInputElement>('textbox', { name: `Alias for ${modelId}` });
+    expect(input.value).toBe(alias);
+    fireEvent.input(input, { target: { value: '' } });
+  }
+  fireEvent.click(edit.getByRole('button', { name: 'Update' }));
+  await waitFor(() => expect(settings.envSnippets[0].modelAliases).toEqual({}));
+  onChanged.mockClear();
+  fireEvent.click(within(container).getByRole('button', { name: 'Insert' }));
+  await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+  expect(getClaudeProviderSettings(settings).modelAliases).toEqual({});
 });
