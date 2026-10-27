@@ -7,7 +7,6 @@ import { createProviderHistoryPathContext } from '@/core/providers/historyPathCo
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ImageAttachment } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
-import { getChatSettingsSnapshot } from '@/features/chat/ChatSettings';
 import type { ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
 import type { ForkSourceUnavailableReason } from '@/features/chat/conversation/forkSourceTypes';
 import { resolveSessionInstructions } from '@/features/chat/execution/projectInstructions';
@@ -31,6 +30,7 @@ export interface SideChatControllerDeps {
   readonly parent: SideChatParent;
   readonly onDestinationChanged: () => void;
   readonly onStatusChanged?: () => void;
+  readonly onSettingsChanged?: () => void;
 }
 
 export interface SideChatControllerPresentation {
@@ -335,11 +335,7 @@ export class SideChatController {
 
   #createRuntime(source: SideChatSource): void {
     const vaultPath = getVaultPath(this.deps.plugin.app);
-    const settingsSnapshot = getChatSettingsSnapshot(
-      this.deps.plugin.settings,
-      source.providerId,
-      source.selectedModel,
-    );
+    const settingsSnapshot = this.deps.parent.getSettings();
     const runtime = new SideChatRuntime({
       buildChildResumeState: async () => {
         await this.#assertForkSourceCurrent(source);
@@ -361,6 +357,7 @@ export class SideChatController {
         new Notice(error instanceof Error ? error.message : 'Side chat execution failed.');
       },
       onStatusChanged: () => this.#refreshPanel(),
+      onSettingsChanged: () => this.deps.onSettingsChanged?.(),
       plugin: this.deps.plugin,
       resolveBackend: providerId => ProviderRegistry.createExecutionBackend(
         this.deps.plugin.providerHost,

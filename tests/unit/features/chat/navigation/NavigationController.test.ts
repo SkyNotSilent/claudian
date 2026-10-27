@@ -164,8 +164,11 @@ describe('NavigationController', () => {
 
     // Mock document for event listeners
     const documentListeners: Map<string, Listener[]> = new Map();
+    const windowEvents = new EventTarget();
     (global as any).document = {
       defaultView: {
+        addEventListener: windowEvents.addEventListener.bind(windowEvents),
+        removeEventListener: windowEvents.removeEventListener.bind(windowEvents),
         requestAnimationFrame: mockRaf,
         cancelAnimationFrame: mockCancelRaf,
       },
@@ -455,6 +458,7 @@ describe('NavigationController', () => {
     it('does not steal focus when the focus key comes from the Linked content editor', () => {
       const focusSpy = jest.spyOn(inputEl, 'focus');
       const linkedContentInput = {
+        tagName: 'INPUT',
         classList: {
           contains: (className: string) => (
             className === 'claudian-linked-content-picker-search'

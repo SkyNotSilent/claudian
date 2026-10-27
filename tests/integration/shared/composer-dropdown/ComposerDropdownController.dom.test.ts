@@ -70,6 +70,66 @@ it('shows vault mentions on the keystroke that requests them and updates the ren
   }
 });
 
+it('repositions fixed suggestions from their own window and releases that listener on destroy', () => {
+  const frame = document.body.createEl('iframe', { attr: { title: 'Popout fixture' } });
+  const owner = frame.contentWindow!;
+  const container = frame.contentDocument!.createElement('div');
+  frame.contentDocument!.body.appendChild(container);
+  // Obsidian supplies this element helper in each window.
+  container.createDiv = HTMLElement.prototype.createDiv;
+  const input = frame.contentDocument!.createElement('textarea');
+  input.setAttribute('aria-label', 'Message');
+  container.appendChild(input);
+  const mention = new MentionSource({ getCachedVaultFiles: () => [file('Alpha.md', 1)], getCachedVaultFolders: () => [] });
+  const controller = new ComposerDropdownController(container, input, [mention], { fixed: true });
+  let top = 250;
+  const measure = jest.spyOn(input, 'getBoundingClientRect').mockImplementation(() => ({
+    top, left: 20, width: 300, height: 28, right: 320, bottom: top + 28,
+  } as DOMRect));
+  try {
+    input.value = '@Al';
+    controller.handleInputChange();
+    const list = within(container).getByRole('listbox', { name: 'Input suggestions' });
+    expect(within(list).getByRole('option', { name: 'Alpha.md' })).toBeDefined();
+    measure.mockClear();
+    top = 100;
+    fireEvent.resize(window);
+    expect(measure).not.toHaveBeenCalled();
+    fireEvent.resize(owner);
+    expect(list.style.getPropertyValue('--claudian-fixed-dropdown-bottom')).toBe(`${owner.innerHeight - top + 4}px`);
+    controller.destroy();
+    measure.mockClear();
+    fireEvent.resize(owner);
+    expect(measure).not.toHaveBeenCalled();
+  } finally {
+    controller.destroy();
+    mention.destroy();
+    frame.remove();
+  }
+});
+it.each(['\nNext paragraph', '\n\nNext paragraph', ' next words'])(
+  'preserves the prompt suffix %j when completing a mention immediately before it', async suffix => {
+    const container = document.body.createDiv();
+    const input = container.createEl('textarea', { attr: { 'aria-label': 'Message' } });
+    const mention = new MentionSource({ getCachedVaultFiles: () => [file('Alpha.md', 1)], getCachedVaultFolders: () => [] });
+    const controller = new ComposerDropdownController(container, input, [mention]);
+    input.value = `@Al${suffix}`;
+    input.setSelectionRange(3, 3);
+    controller.handleInputChange();
+    try {
+      const option = within(container).getByRole('option', { name: 'Alpha.md' });
+      expect(input.getAttribute('aria-activedescendant')).toBe(option.id);
+      expect(controller.handleKeydown(new KeyboardEvent('keydown', { key: 'Enter', cancelable: true }))).toBe(true);
+      expect(input.value).toBe(`@Alpha.md ${suffix.startsWith(' ') ? suffix.slice(1) : suffix}`);
+      expect(input.selectionStart).toBe('@Alpha.md '.length);
+      expect(controller.isVisible()).toBe(false);
+      expect(await axe(container)).toHaveNoViolations();
+    } finally {
+      controller.destroy(); mention.destroy(); container.remove();
+    }
+  },
+);
+
 describe.each([false, true])('local suggestion scrolling (fixed: %s)', fixed => {
   const nativeScroll = Element.prototype.scrollIntoView;
   afterEach(() => { Element.prototype.scrollIntoView = nativeScroll; });
