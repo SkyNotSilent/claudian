@@ -24,12 +24,15 @@ import type { ProviderCapabilities } from '@/core/providers/types';
 import { getToolIcon } from '@/core/tools/toolIcons';
 import type { ClaudianSettings, Conversation, StreamChunk } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import { ChatState } from '@/features/chat/state/ChatState';
 import { destroyTab } from '@/features/chat/tabs/TabLifecycle';
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 import { FLAVOR_TEXTS } from '@/features/chat/turns/flavorTexts';
 import { createChatFocusCommand } from '@/features/chat/workspace/ChatFocusCommand';
+import type { ZenPresentationPort } from '@/features/chat/zen/types';
 import { ZenModeController } from '@/features/chat/zen/ZenModeController';
+import { ZenModePanel } from '@/features/chat/zen/ZenModePanel';
 import { adaptCodexStreamChunk } from '@/providers/codex/execution/CodexExecutionEventNormalizer';
 import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
 import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
@@ -1680,4 +1683,81 @@ it('releases every moved node and subscription on close and disposal', async () 
   expect(zenPanel()).toBeNull();
   expect(workspace.listenerCount()).toBe(0);
   expect(screen.queryByRole('region', { name: 'Claudian chat' })).toBeNull();
+});
+
+it('announces the current error when the same zen panel binds another failed session', async () => {
+  const host = document.body.createDiv();
+  const panel = new ZenModePanel(host, { keymap: null, parentScope: new Scope(),
+    historyExpanded: false, position: null, onPositionChange() {}, onHistoryExpandedChange() {} });
+  cleanups.push(() => panel.destroy());
+  const source = (message: string): ZenPresentationPort => {
+    const state = new ChatState();
+    state.addMessage({ id: 'prompt', role: 'user', content: 'Please help', timestamp: testDate().getTime() });
+    state.addMessage({ id: 'reply', role: 'assistant', content: message, timestamp: testDate().getTime() });
+    state.recordActivity({ kind: 'error', message });
+    return { state, window, subscribeActivity: listener => state.subscribeActivity(listener),
+      captureScroll: () => ({ top: 0, follow: false }), restoreScroll() {} };
+  };
+  const first = source('Provider overloaded');
+  const second = source('Authentication expired');
+  panel.bind(first, 'claude');
+  const status = within(host).getByRole('status');
+  expect(status.textContent).toBe('Error: Provider overloaded');
+  panel.bind(second, 'claude');
+  expect(status.textContent).toBe('Error: Authentication expired');
+  expect(within(host).getByRole('button', { name: 'Show conversation', description: 'Error: Authentication expired' })).toBeDefined();
+  expect(await axe(host)).toHaveNoViolations();
+
+  const mutations = new MutationObserver(() => undefined);
+  mutations.observe(status, { childList: true, characterData: true, subtree: true });
+  jest.useFakeTimers();
+  try {
+    panel.bind(second, 'claude');
+    jest.advanceTimersByTime(50);
+    expect(status.textContent).toBe('Error: Authentication expired');
+    expect(mutations.takeRecords()).toHaveLength(0);
+  } finally {
+    mutations.disconnect(); jest.useRealTimers();
+  }
+});
+
+it('keeps Open Claudian on the active chat view before applying an explicit destination', async () => {
+  const fixture = await createZenFixture();
+  const second = await fixture.addView('main');
+  fixture.tab.controllers.drafts.restore('main', { content: 'First session draft' });
+  second.tab.controllers.drafts.restore('main', { content: 'Second session draft' });
+  fixture.workspace.getActiveViewOfType.mockReturnValue(second.view);
+  second.tab.composer.focus();
+  expect(second.tab.composer.isFocused()).toBe(true);
+
+  await fixture.views.activateView();
+  expect(fixture.workspace.revealLeaf.mock.calls.at(-1)?.[0] === second.leaf).toBe(true);
+  expect(second.tab.composer.isFocused()).toBe(true);
+  expect(fixture.tab.composer.isFocused()).toBe(false);
+  expect(second.tab.controllers.drafts.capture('main').content).toBe('Second session draft');
+  expect(fixture.tab.controllers.drafts.capture('main').content).toBe('First session draft');
+  expect(fixture.sessions).toHaveLength(0);
+
+  await fixture.views.activateView(fixture.view.leaf);
+  expect(fixture.workspace.revealLeaf.mock.calls.at(-1)?.[0] === fixture.leaf).toBe(true);
+  expect(fixture.tab.composer.isFocused()).toBe(true);
+  fixture.workspace.getActiveViewOfType.mockReturnValue(null);
+  await fixture.views.activateView();
+  expect(fixture.workspace.revealLeaf.mock.calls.at(-1)?.[0] === fixture.leaf).toBe(true);
+  fixture.leaves.splice(fixture.leaves.indexOf(second.leaf), 1);
+  fixture.workspace.getActiveViewOfType.mockReturnValue(second.view);
+  await fixture.views.activateView();
+  expect(fixture.workspace.revealLeaf.mock.calls.at(-1)?.[0] === fixture.leaf).toBe(true);
+  expect(fixture.sessions).toHaveLength(0);
+});
+
+it('retains the first deferred chat leaf fallback when no chat is active', async () => {
+  const fixture = await createZenFixture();
+  const deferredLeaf = { ...fixture.leaf, view: {}, isDeferred: true };
+  fixture.leaves.unshift(deferredLeaf);
+  fixture.workspace.getActiveViewOfType.mockReturnValue(null);
+  await fixture.views.activateView();
+  expect(fixture.workspace.revealLeaf.mock.calls.at(-1)?.[0] === deferredLeaf).toBe(true);
+  expect(fixture.views.getView() === fixture.view).toBe(true);
+  expect(fixture.sessions).toHaveLength(0);
 });

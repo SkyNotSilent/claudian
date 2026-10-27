@@ -8,11 +8,18 @@ import { Notice } from 'obsidian';
 
 import { ClaudianSettingsStorage } from '@/app/settings/ClaudianSettingsStorage';
 import { DEFAULT_CLAUDIAN_SETTINGS } from '@/app/settings/defaultSettings';
+import { ProviderChatOptionsReconciler } from '@/app/settings/ProviderChatOptionsReconciler';
 import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
 import type { ProviderHost } from '@/core/providers/ProviderHost';
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
+import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
+import { getChatSettingsSnapshot } from '@/features/chat/ChatSettings';
+import { ChatViewPublisher } from '@/features/chat/workspace/ChatViewPublisher';
 import { getClaudeProviderSettings, updateClaudeProviderSettings } from '@/providers/claude/settings';
+import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 import { EnvSnippetManager, EnvSnippetModal } from '@/shared/settings/EnvSnippetManager';
+import { ModelSelector } from '@/shared/toolbar/ModelSelector';
 
 jest.mock('obsidian', () => jest.requireActual('../../../helpers/ObsidianSettingsDOM'));
 
@@ -78,6 +85,7 @@ it('preserves own context-limit keys when inserting a snippet with production ob
   }];
   const coordinator = new SettingsCoordinator(settings, async () => undefined);
   const host = {
+    notifyProviderChatOptionsChanged: jest.fn(),
     settings,
     app: { workspace: { getLeavesOfType: () => [] } },
     applyEnvironmentVariables: async () => undefined,
@@ -106,6 +114,7 @@ it.each(aliasCases)('applies snippet aliases through provider settings while pre
   }];
   const applyEnvironmentVariables = jest.fn().mockResolvedValue(undefined);
   const host = {
+    notifyProviderChatOptionsChanged: jest.fn(),
     settings, applyEnvironmentVariables,
     app: { workspace: { getLeavesOfType: () => [] } },
     mutateSettings: async (mutate: Parameters<ProviderHost['mutateSettings']>[0]) => { await mutate(settings); },
@@ -132,6 +141,7 @@ it('offers saving the current environment from the empty snippet state', async (
   const settings = JSON.parse(JSON.stringify(DEFAULT_CLAUDIAN_SETTINGS)) as typeof DEFAULT_CLAUDIAN_SETTINGS;
   settings.envSnippets = [];
   const host = {
+    notifyProviderChatOptionsChanged: jest.fn(),
     settings,
     app: { workspace: { getLeavesOfType: () => [] } },
     getEnvironmentVariablesForScope: () => 'ANTHROPIC_MODEL=custom',
@@ -147,11 +157,25 @@ it('offers saving the current environment from the empty snippet state', async (
   });
 
   const dialog = within(document.body).getByRole('dialog', { name: 'Save snippet' });
-  expect(within(dialog).getByDisplayValue('ANTHROPIC_MODEL=custom')).toBeTruthy();
   await joinFocusTimers();
+  expect(await axe(dialog)).toHaveNoViolations();
+  const name = within(dialog).getByRole('textbox', { name: 'Name' });
+  const description = within(dialog).getByRole('textbox', { name: 'Description' });
+  const environment = within(dialog).getByRole('textbox', { name: 'Environment variables' });
+  expect((environment as HTMLTextAreaElement).value).toBe('ANTHROPIC_MODEL=custom');
+  fireEvent.input(name, { target: { value: 'Work endpoint' } });
+  fireEvent.input(description, { target: { value: 'Used for work' } });
+  fireEvent.input(environment, { target: { value: 'ANTHROPIC_MODEL=custom\nANTHROPIC_BASE_URL=https://example.invalid' } });
+  fireEvent.blur(environment);
   expect(['Cancel', 'Save'].map(name =>
     within(dialog).getByRole<HTMLButtonElement>('button', { name }).type,
   )).toEqual(['button', 'button']);
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+  await waitFor(() => expect(within(document.body).queryByRole('dialog', { name: 'Save snippet' })).toBeNull());
+  expect(settings.envSnippets).toEqual([expect.objectContaining({
+    name: 'Work endpoint', description: 'Used for work', envVars: 'ANTHROPIC_MODEL=custom\nANTHROPIC_BASE_URL=https://example.invalid',
+  })]);
+  await waitFor(() => expect(within(container).getByRole('button', { name: 'Insert' })).toBeTruthy());
 });
 
 it.each([
@@ -310,7 +334,10 @@ it.each((['Update', 'name Enter', 'Save'] as const).flatMap(action =>
     expect(submit()).toBe(action !== 'name Enter');
     await waitFor(() => expect(persist).toHaveBeenCalledTimes(1));
     expect(coordinator.getCommittedSettings()).toEqual(originalSettings);
-    expect(within(document.body).queryByRole('dialog', { name: dialogName })).toBeNull();
+    expect(within(document.body).getByRole('dialog', { name: dialogName })).toBe(dialog);
+    expect(fields.getAllByRole<HTMLInputElement>('textbox').every(input => input.disabled)).toBe(true);
+    fireEvent.keyDown(nameField, { key: 'Enter' });
+    fireEvent.click(fields.getByRole('button', { name: action === 'Save' ? 'Save' : 'Update' }));
     const savedSnippet = {
       id: expect.stringMatching(action === 'Save' ? /^snippet-/ : /^snippet$/),
       name: 'Renamed snippet name', description: 'Draft description', scope: 'provider:claude',
@@ -323,6 +350,7 @@ it.each((['Update', 'name Enter', 'Save'] as const).flatMap(action =>
     completePersistence();
     const success = `Environment snippet "Renamed snippet name" ${action === 'Save' ? 'saved' : 'updated'}`;
     await waitFor(() => expect(notifyCalls(notice)).toContain(success));
+    expect(within(document.body).queryByRole('dialog', { name: dialogName })).toBeNull();
     expect(notifyCalls(notice)).toEqual([
       'Invalid format. Use: 256k, 1m, or exact count (1000-10000000).', success,
     ]);
@@ -333,51 +361,85 @@ it.each((['Update', 'name Enter', 'Save'] as const).flatMap(action =>
   },
 );
 
-it('reports a save failure notice and keeps settings unchanged when snippet persistence fails', async () => {
+it.each(['Save', 'Update'] as const)('retains every %s draft after persistence fails and retries from that same modal', async action => {
   const notice = Notice as unknown as jest.Mock;
   notice.mockClear();
-  const settings = JSON.parse(JSON.stringify(DEFAULT_CLAUDIAN_SETTINGS)) as typeof DEFAULT_CLAUDIAN_SETTINGS;
-  settings.envSnippets = [];
-  const persist = jest.fn<Promise<void>, [typeof settings]>().mockRejectedValue(new Error('storage unavailable'));
-  const coordinator = new SettingsCoordinator(settings, persist);
-  const host = {
-    settings,
-    app: { workspace: { getLeavesOfType: () => [] } },
-    getEnvironmentVariablesForScope: () => 'ANTHROPIC_MODEL=custom',
-    mutateSettings: coordinator.mutate.bind(coordinator),
-  } as unknown as ProviderHost;
-  const container = document.body.createEl('main');
-  new EnvSnippetManager(container, host, 'provider:claude');
-
-  const joinFocusTimers = captureModalFocusTimers(() => {
-    fireEvent.click(within(container).getByRole('button', { name: 'Save current environment as a snippet' }));
-  });
-  const dialog = within(document.body).getByRole('dialog', { name: 'Save snippet' });
-  const nameField = within(within(dialog).getByText('Name').parentElement!).getByRole('textbox');
-  fireEvent.input(nameField, { target: { value: 'New snippet name' } });
-  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
-
-  await waitFor(() => expect(notifyCalls(notice)).toContain('Could not complete environment snippet save'));
-  await joinFocusTimers();
-  expect(persist).toHaveBeenCalled();
-  expect(coordinator.getCommittedSettings().envSnippets).toEqual([]);
-  expect(within(container).getByRole('button', { name: 'Save current environment as a snippet' })).toBeTruthy();
-  expect(within(container).queryByText('New snippet name')).toBeNull();
-  expect(notifyCalls(notice).filter((message) => message === 'Could not complete environment snippet save')).toHaveLength(1);
-  expect(notifyCalls(notice)).not.toContain('Environment snippet "New snippet name" saved');
-});
-
-it('reports an update failure notice and keeps the original snippet when persistence fails', async () => {
-  const notice = Notice as unknown as jest.Mock;
-  notice.mockClear();
-  const settings = JSON.parse(JSON.stringify(DEFAULT_CLAUDIAN_SETTINGS)) as typeof DEFAULT_CLAUDIAN_SETTINGS;
-  settings.envSnippets = [{
+  const settings = structuredClone(DEFAULT_CLAUDIAN_SETTINGS);
+  settings.envSnippets = action === 'Save' ? [] : [{
     id: 'snippet', name: 'Existing snippet name', description: '', scope: 'provider:claude',
     envVars: 'ANTHROPIC_MODEL=custom',
   }];
-  const originalSnippets = JSON.parse(JSON.stringify(settings.envSnippets));
-  const persist = jest.fn<Promise<void>, [typeof settings]>().mockRejectedValue(new Error('storage unavailable'));
+  const originalSnippets = structuredClone(settings.envSnippets);
+  const persist = jest.fn<Promise<void>, [typeof settings]>()
+    .mockRejectedValueOnce(new Error('storage unavailable')).mockResolvedValue(undefined);
   const coordinator = new SettingsCoordinator(settings, persist);
+  const host = {
+    notifyProviderChatOptionsChanged: jest.fn(),
+    settings,
+    app: { workspace: { getLeavesOfType: () => [] } },
+    getEnvironmentVariablesForScope: () => 'ANTHROPIC_MODEL=custom',
+    mutateSettings: coordinator.mutate.bind(coordinator),
+  } as unknown as ProviderHost;
+  const container = document.body.createEl('main');
+  new EnvSnippetManager(container, host, 'provider:claude');
+  const joinFocusTimers = captureModalFocusTimers(() => {
+    fireEvent.click(within(container).getByRole('button', {
+      name: action === 'Save' ? 'Save current environment as a snippet' : 'Edit',
+    }));
+  });
+  await joinFocusTimers();
+  const title = action === 'Save' ? 'Save snippet' : 'Edit snippet';
+  const dialog = within(document.body).getByRole('dialog', { name: title });
+  const fields = within(dialog);
+  const field = (name: string) => within(fields.getByText(name).parentElement!).getByRole<HTMLInputElement>('textbox');
+  const name = 'Work endpoint';
+  const description = 'Keep these settings';
+  const envVars = 'ANTHROPIC_MODEL=custom\nANTHROPIC_BASE_URL=https://example.invalid';
+  fireEvent.input(field('Name'), { target: { value: name } });
+  fireEvent.input(field('Description'), { target: { value: description } });
+  fireEvent.input(field('Environment variables'), { target: { value: envVars } });
+  fireEvent.blur(field('Environment variables'));
+  fireEvent.input(fields.getByRole('textbox', { name: 'Alias for custom' }), { target: { value: 'Work model' } });
+  fireEvent.input(fields.getByRole('textbox', { name: 'Context window for custom' }), { target: { value: '64k' } });
+  const save = fields.getByRole<HTMLButtonElement>('button', { name: action });
+  fireEvent.click(save);
+  const error = `Could not complete environment snippet ${action === 'Save' ? 'save' : 'update'}`;
+  await waitFor(() => expect(notifyCalls(notice)).toContain(error));
+  expect(persist).toHaveBeenCalledTimes(1);
+  expect(coordinator.getCommittedSettings().envSnippets).toEqual(originalSnippets);
+  expect(within(document.body).getByRole('dialog', { name: title })).toBe(dialog);
+  expect(field('Name').value).toBe(name);
+  expect(field('Description').value).toBe(description);
+  expect(field('Environment variables').value).toBe(envVars);
+  expect(fields.getByRole<HTMLInputElement>('textbox', { name: 'Alias for custom' }).value).toBe('Work model');
+  expect(fields.getByRole<HTMLInputElement>('textbox', { name: 'Context window for custom' }).value).toBe('64k');
+  expect(save.disabled).toBe(false);
+  expect(within(container).queryByText(name)).toBeNull();
+  expect(notifyCalls(notice)).toEqual([error]);
+  expect(await axe(save.parentElement!)).toHaveNoViolations();
+  fireEvent.click(save);
+  const success = `Environment snippet "${name}" ${action === 'Save' ? 'saved' : 'updated'}`;
+  await waitFor(() => expect(notifyCalls(notice)).toContain(success));
+  expect(within(document.body).queryByRole('dialog', { name: title })).toBeNull();
+  expect(persist).toHaveBeenCalledTimes(2);
+  expect(coordinator.getCommittedSettings().envSnippets).toEqual([expect.objectContaining({
+    name, description, envVars, modelAliases: { custom: 'Work model' }, contextLimits: { custom: 64000 },
+  })]);
+  expect(within(container).getByText(name)).toBeTruthy();
+  expect(notifyCalls(notice)).toEqual([error, success]);
+});
+
+it.each(['Save', 'Update'] as const)('does not offer another %s after persistence committed but publication failed', async action => {
+  const notice = Notice as unknown as jest.Mock;
+  notice.mockClear();
+  const settings = structuredClone(DEFAULT_CLAUDIAN_SETTINGS);
+  settings.envSnippets = action === 'Save' ? [] : [{
+    id: 'snippet', name: 'Existing snippet name', description: '', scope: 'provider:claude',
+    envVars: 'ANTHROPIC_MODEL=custom',
+  }];
+  const persist = jest.fn<Promise<void>, [typeof settings]>().mockResolvedValue(undefined);
+  const publish = jest.fn(() => { throw new Error('view refresh failed'); });
+  const coordinator = new SettingsCoordinator(settings, persist, publish);
   const host = {
     settings,
     app: { workspace: { getLeavesOfType: () => [] } },
@@ -386,23 +448,22 @@ it('reports an update failure notice and keeps the original snippet when persist
   } as unknown as ProviderHost;
   const container = document.body.createEl('main');
   new EnvSnippetManager(container, host, 'provider:claude');
-
-  const joinFocusTimers = captureModalFocusTimers(() => {
-    fireEvent.click(within(container).getByRole('button', { name: 'Edit' }));
-  });
-  const dialog = within(document.body).getByRole('dialog', { name: 'Edit snippet' });
-  const nameField = within(within(dialog).getByText('Name').parentElement!).getByRole('textbox');
-  fireEvent.input(nameField, { target: { value: 'Renamed snippet name' } });
-  fireEvent.click(within(dialog).getByRole('button', { name: 'Update' }));
-
-  await waitFor(() => expect(notifyCalls(notice)).toContain('Could not complete environment snippet update'));
-  await joinFocusTimers();
-  expect(persist).toHaveBeenCalled();
-  expect(coordinator.getCommittedSettings().envSnippets).toEqual(originalSnippets);
-  expect(within(container).getByText('Existing snippet name')).toBeTruthy();
-  expect(within(container).queryByText('Renamed snippet name')).toBeNull();
-  expect(notifyCalls(notice).filter((message) => message === 'Could not complete environment snippet update')).toHaveLength(1);
-  expect(notifyCalls(notice)).not.toContain('Environment snippet "Renamed snippet name" updated');
+  await captureModalFocusTimers(() => {
+    fireEvent.click(within(container).getByRole('button', {
+      name: action === 'Save' ? 'Save current environment as a snippet' : 'Edit',
+    }));
+  })();
+  const title = action === 'Save' ? 'Save snippet' : 'Edit snippet';
+  const dialog = within(document.body).getByRole('dialog', { name: title });
+  const name = within(within(dialog).getByText('Name').parentElement!).getByRole('textbox');
+  fireEvent.input(name, { target: { value: 'Committed snippet' } });
+  fireEvent.click(within(dialog).getByRole('button', { name: action }));
+  await waitFor(() => expect(notifyCalls(notice)).toEqual(['Environment snippet was saved, but settings refresh failed.']));
+  expect(within(document.body).queryByRole('dialog', { name: title })).toBeNull();
+  expect(persist).toHaveBeenCalledTimes(1);
+  expect(publish).toHaveBeenCalledTimes(1);
+  expect(settings.envSnippets).toEqual([expect.objectContaining({ name: 'Committed snippet' })]);
+  expect(within(container).getByText('Committed snippet')).toBeTruthy();
 });
 
 it('saves a snippet through the coordinator and renders it when persistence succeeds', async () => {
@@ -413,6 +474,7 @@ it('saves a snippet through the coordinator and renders it when persistence succ
   const persist = jest.fn<Promise<void>, [typeof settings]>().mockResolvedValue(undefined);
   const coordinator = new SettingsCoordinator(settings, persist);
   const host = {
+    notifyProviderChatOptionsChanged: jest.fn(),
     settings,
     app: { workspace: { getLeavesOfType: () => [] } },
     getEnvironmentVariablesForScope: () => 'ANTHROPIC_MODEL=custom',
@@ -460,6 +522,7 @@ it.each(['', '   '])('clears a context override (%p) through the coordinator whi
   const persist = jest.fn<Promise<void>, [typeof settings]>().mockResolvedValue(undefined);
   const coordinator = new SettingsCoordinator(settings, persist);
   const host = {
+    notifyProviderChatOptionsChanged: jest.fn(),
     settings,
     app: { workspace: { getLeavesOfType: () => [] } },
     getEnvironmentVariablesForScope: () => 'ANTHROPIC_MODEL=custom',
@@ -520,6 +583,7 @@ it('saves, reloads and inserts snippet overrides for prototype-named custom mode
   const coordinator = new SettingsCoordinator(settings, value => storage.save(value));
   const onChanged = jest.fn();
   const host = {
+    notifyProviderChatOptionsChanged: jest.fn(),
     settings, mutateSettings: coordinator.mutate.bind(coordinator),
     app: { workspace: { getLeavesOfType: () => [] } },
     getEnvironmentVariablesForScope: () => envVars,
@@ -579,4 +643,57 @@ it('saves, reloads and inserts snippet overrides for prototype-named custom mode
   fireEvent.click(within(container).getByRole('button', { name: 'Insert' }));
   await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
   expect(getClaudeProviderSettings(settings).modelAliases).toEqual({});
+});
+
+
+it('publishes inserted aliases to every mounted model selector', async () => {
+  const settings = structuredClone(DEFAULT_CLAUDIAN_SETTINGS);
+  settings.model = 'claude-code/custom';
+  updateClaudeProviderSettings(settings, {
+    discoveredModels: [{ value: 'custom', label: 'Native custom', description: '' }],
+    visibleModels: ['custom'], modelAliases: { custom: 'Old alias' },
+    environmentVariables: 'ANTHROPIC_MODEL=custom',
+  });
+  settings.envSnippets = [{ id: 'snippet', name: 'Alias only', description: '', scope: 'provider:claude',
+    envVars: 'ANTHROPIC_MODEL=custom', modelAliases: { custom: 'New alias' } }];
+  const containers = [document.body.createDiv(), document.body.createDiv()];
+  const selectors = containers.map(container => new ModelSelector(container, {
+    getSettings: () => getChatSettingsSnapshot(settings, 'claude', settings.model),
+    getUIConfig: () => claudeChatUIConfig,
+    onModelChange: async () => undefined,
+    onEffortLevelChange: async () => undefined,
+    getCapabilities: () => ProviderRegistry.getCapabilities('claude'),
+  }));
+  const views = selectors.map(selector => ({ refreshModelSelector() { selector.updateDisplay(); selector.renderOptions(); } }));
+  const publisher = new ChatViewPublisher({
+    views: { getAllViews: () => views as never }, zenMode: { reconcile() {} }, inactiveSessions: { request() {} },
+    hasLoadedAllSessionMetadata: () => true,
+  });
+  let saved = '';
+  const coordinator = new SettingsCoordinator(settings, async draft => { saved = JSON.stringify(draft); },
+    (current, previous) => publisher.publishSettings(current, previous));
+  const reconciler = new ProviderChatOptionsReconciler({
+    settings: coordinator,
+    providers: { getProviderDisplayName: () => 'Claude' }, providerSettings: ProviderSettingsCoordinator,
+    reconcileConversationModels: async () => [], onSettingsReconciled() {}, onConversationsChanged() {},
+    onReconciled: providerId => publisher.refreshModelSelector(providerId),
+  });
+  const host = {
+    settings, app: { workspace: { getLeavesOfType: () => views.map(view => ({ view })) } },
+    // The snippet uses the already-applied environment; this boundary has no runtime changes to publish.
+    applyEnvironmentVariables: async () => undefined,
+    mutateSettings: coordinator.mutate.bind(coordinator),
+    notifyProviderChatOptionsChanged: (providerId: string) => { void reconciler.notifyChanged(providerId); },
+  } as unknown as ProviderHost;
+  for (const container of containers) expect(within(container).getByRole('button', { name: 'Model: Old alias' })).toBeTruthy();
+  const manager = document.body.createDiv();
+  new EnvSnippetManager(manager, host, 'provider:claude');
+
+  fireEvent.click(within(manager).getByRole('button', { name: 'Insert' }));
+
+  for (const container of containers) {
+    await waitFor(() => expect(within(container).getByRole('button', { name: 'Model: New alias' })).toBeTruthy());
+  }
+  expect(getClaudeProviderSettings(JSON.parse(saved)).modelAliases).toMatchObject({ custom: 'New alias' });
+  expect(await axe(manager)).toHaveNoViolations();
 });
