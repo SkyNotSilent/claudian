@@ -16,6 +16,8 @@ import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import type { ClaudianSettings, Conversation, ConversationMutablePatch } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import { getChatSettingsSnapshot } from '@/features/chat/ChatSettings';
+import { getSessionSettingsSnapshot, updateSessionProviderSettings, updateSessionReasoning } from '@/features/chat/sessions/sessionSettings';
 import { activateTab, destroyTab } from '@/features/chat/tabs/TabLifecycle';
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import { t } from '@/i18n/i18n';
@@ -79,11 +81,11 @@ function setup() {
   } as unknown as ChatFeatureHost;
   const statusChanges = jest.fn();
   const pool = installSessionRuntimePool(plugin, { onChanged: statusChanges });
-  const attach = async (options: { blank?: boolean } = {}) => {
+  const attach = async (options: { blank?: boolean; openConversation?: (id: string) => Promise<void> } = {}) => {
     const tab = await createTabRuntime({
       plugin, conversation: options.blank ? undefined : conversation, component: new Component(), containerEl: document.body.createDiv(),
       mentionDataProvider: new VaultMentionDataProvider(app), getProviderCatalogConfig: () => null,
-      isRuntimeLive: () => true, openConversation: async () => undefined, startNewConversation: async () => undefined,
+      isRuntimeLive: () => true, openConversation: options.openConversation ?? (async () => undefined), startNewConversation: async () => undefined,
     });
     await tab.session.runtime.model.hydrate();
     activateTab(tab);
@@ -357,6 +359,37 @@ it('retains failed queued reference preparation as session recovery after its ta
   await destroyTab(second);
 });
 
+it('preserves raw drafts when multiple reference preparations recover after detachment', async () => {
+  const h = setup();
+  const first = await h.attach();
+  first.controllers.drafts.restore('main', { content: 'First request' });
+  const sending = first.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.backend.sessions[0]?.requests).toHaveLength(1));
+  const reference = deferred<Conversation | null>();
+  jest.mocked(h.plugin.getConversationById)
+    .mockImplementationOnce(() => reference.promise)
+    .mockResolvedValueOnce(null);
+  const firstDraft = '    keepIndented()\n\n@[First](claudian-session:conv-1-source)  \n';
+  first.controllers.drafts.restore('main', { content: firstDraft });
+  const preparingFirst = first.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.plugin.getConversationById).toHaveBeenCalledWith('conv-1-source'));
+  const secondDraft = '@[Second](claudian-session:conv-2-source)';
+  first.controllers.drafts.restore('main', { content: secondDraft });
+  const preparingSecond = first.controllers.inputController.sendMessage();
+  await destroyTab(first);
+  h.backend.latest.complete();
+  await sending;
+  reference.resolve(null);
+  await Promise.all([preparingFirst, preparingSecond]);
+
+  expect(first.session.runtime.model.composer.hasRecovery).toBe(true);
+  const second = await h.attach();
+  expect(second.controllers.drafts.capture('main').content).toBe(`${secondDraft}\n\n${firstDraft}`);
+  expect(h.backend.latest.requests).toHaveLength(1);
+  expect(second.session.runtime.model.composer.hasRecovery).toBe(false);
+  await destroyTab(second);
+});
+
 it('fences a detached side queue synchronously before the plugin shutdown drain', async () => {
   const h = setup();
   const first = await h.attach();
@@ -508,6 +541,31 @@ it('publishes session status only when its list projection changes', async () =>
   await sending;
   expect(h.pool.isRunning('conversation')).toBe(false);
   expect(h.statusChanges).toHaveBeenCalled();
+  await destroyTab(tab);
+});
+
+it('keeps a newer composer draft when first conversation creation fails', async () => {
+  const h = setup();
+  const creating = deferred<Conversation>();
+  Object.assign(h.plugin, { createConversation: jest.fn(() => creating.promise) });
+  Object.assign(h.plugin.app.workspace, { getActiveFile: () => null });
+  const tab = await h.attach({ blank: true });
+  tab.controllers.drafts.restore('main', { content: 'First request' });
+  const sending = tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.plugin.createConversation).toHaveBeenCalled());
+  const newerDraft = '    followUp()\n';
+  const newerImage = { id: 'new-image', name: 'next.png', mediaType: 'image/png' as const,
+    data: 'bmV4dA==', size: 4, source: 'paste' as const };
+  tab.controllers.drafts.restore('main', { content: newerDraft, images: [newerImage] });
+  creating.reject(new Error('Disk full'));
+  await Promise.allSettled([sending]);
+
+  expect(tab.controllers.drafts.capture('main')).toEqual({
+    content: `First request\n\n${newerDraft}`, images: [newerImage],
+  });
+  expect(tab.state.messages).toEqual([]);
+  expect(tab.state.currentConversationId).toBeNull();
+  expect(h.backend.sessions.flatMap(session => session.requests)).toEqual([]);
   await destroyTab(tab);
 });
 
@@ -847,4 +905,147 @@ it('rematches an open mention after editing queued input back into the composer'
     await destroyTab(tab);
     await h.pool.dispose();
   }
+});
+
+it('copies the parent session selections into a new side chat after another session changes preferences', async () => {
+  const h = setup();
+  const tab = await h.attach();
+  const runtime = tab.session.runtime;
+  tab.state.messages = [
+    { id: 'parent-user', role: 'user', content: 'Parent task', timestamp: testDate().getTime() },
+    { id: 'parent-answer', role: 'assistant', content: 'Parent answer', assistantMessageId: 'checkpoint', timestamp: testDate().getTime() },
+  ];
+  await updateSessionProviderSettings(runtime, h.plugin, settings => {
+    settings.permissionMode = 'manual'; settings.serviceTier = 'fast';
+  });
+  await updateSessionReasoning(runtime, h.plugin, 'low');
+  const other = h.pool.ensure({ conversationId: 'other-conversation', providerId: 'claude', draftModel: null });
+  await updateSessionProviderSettings(other, h.plugin, settings => {
+    settings.permissionMode = 'yolo'; settings.serviceTier = 'default';
+  });
+  await updateSessionReasoning(other, h.plugin, 'high');
+  expect(getSessionSettingsSnapshot(runtime, h.plugin)).toMatchObject({
+    permissionMode: 'manual', reasoning: 'low', serviceTier: 'fast',
+  });
+  jest.spyOn(ProviderRegistry.getConversationHistoryService('claude'), 'buildForkProviderState').mockResolvedValue({});
+  const sending = tab.controllers.sideChatController.handleCommandSubmission('Explore independently', []);
+  await waitFor(() => expect(h.backend.sessions[0]?.requests).toHaveLength(1));
+  const configuration = h.backend.latest.requests[0].configuration;
+  h.backend.latest.complete();
+  await sending;
+  expect(configuration).toMatchObject({ permissionMode: 'manual', reasoning: 'low', serviceTier: 'fast' });
+  expect(getChatSettingsSnapshot(h.plugin.settings, 'claude', 'claude-sonnet-4-5')).toMatchObject({
+    permissionMode: 'yolo', reasoning: 'high', serviceTier: 'default',
+  });
+  await updateSessionProviderSettings(runtime, h.plugin, settings => {
+    settings.permissionMode = 'normal'; settings.serviceTier = 'default';
+  });
+  await updateSessionReasoning(runtime, h.plugin, 'high');
+  const followUp = tab.controllers.sideChatController.submitToSide('Continue the child', []);
+  await waitFor(() => expect(h.backend.latest.requests).toHaveLength(2));
+  h.backend.latest.complete();
+  await followUp;
+  expect(h.backend.latest.requests[1].configuration).toMatchObject({
+    permissionMode: 'manual', reasoning: 'low', serviceTier: 'fast',
+  });
+  expect(getSessionSettingsSnapshot(other, h.plugin)).toMatchObject({
+    permissionMode: 'yolo', reasoning: 'high', serviceTier: 'default',
+  });
+  await destroyTab(tab);
+});
+
+it('keeps archived sessions out of the composer resume picker', async () => {
+  const h = setup();
+  const current = h.plugin.getConversationSummary('conversation') as Conversation;
+  const active = { ...current, id: 'active-session', title: 'Active task' };
+  const archived = { ...current, id: 'archived-session', title: 'Archived task', isArchived: true,
+    lastActivityAt: testDate({ minutes: 1 }).getTime() };
+  Object.assign(h.plugin, { getConversationList: () => [archived, active] });
+  const openConversation = jest.fn(async () => undefined);
+  const tab = await h.attach({ openConversation });
+  tab.dom.inputEl.value = '/sessions';
+  await tab.controllers.inputController.sendMessage();
+  const list = within(tab.dom.inputContainerEl).getByRole('listbox', { name: 'Resume conversation' });
+  expect(within(list).getByRole('option', { name: /Active task/ })).toBeDefined();
+  expect(within(list).queryByRole('option', { name: /Archived task/ })).toBeNull();
+  fireEvent.keyDown(tab.dom.inputEl, { key: 'Enter' });
+  expect(openConversation).toHaveBeenCalledWith('active-session');
+  expect(h.backend.sessions).toHaveLength(0);
+  expect(within(tab.dom.inputContainerEl).queryByRole('listbox', { name: 'Resume conversation' })).toBeNull();
+  await destroyTab(tab);
+});
+
+it('does not open an empty resume picker when only archived sessions exist', async () => {
+  const h = setup();
+  Object.assign(h.plugin.app.workspace, { getActiveFile: () => null });
+  const archived = { ...h.plugin.getConversationSummary('conversation')!, isArchived: true };
+  Object.assign(h.plugin, { getConversationList: () => [archived] });
+  const tab = await h.attach({ blank: true });
+  tab.dom.inputEl.value = '/sessions';
+  await tab.controllers.inputController.sendMessage();
+  expect(within(tab.dom.inputContainerEl).queryByRole('listbox', { name: 'Resume conversation' })).toBeNull();
+  expect(h.backend.sessions).toHaveLength(0);
+  await destroyTab(tab);
+});
+
+it.each(['main', 'side'] as const)('keeps native requested permission changes for the %s destination', async destination => {
+  const h = setup();
+  await h.plugin.mutateSettings(settings => { settings.permissionMode = 'manual'; });
+  const tab = await h.attach();
+  let sending: Promise<unknown>;
+  if (destination === 'side') {
+    tab.state.messages = [
+      { id: 'parent-user', role: 'user', content: 'Parent task', timestamp: testDate().getTime() },
+      { id: 'parent-answer', role: 'assistant', content: 'Parent answer', assistantMessageId: 'checkpoint', timestamp: testDate().getTime() },
+    ];
+    jest.spyOn(ProviderRegistry.getConversationHistoryService('claude'), 'buildForkProviderState').mockResolvedValue({});
+    sending = tab.controllers.sideChatController.handleCommandSubmission('Explore independently', []);
+  } else {
+    tab.controllers.drafts.restore('main', { content: 'First request' });
+    sending = tab.controllers.inputController.sendMessage();
+  }
+  await waitFor(() => expect(h.backend.sessions[0]?.requests).toHaveLength(1));
+  h.backend.latest.emitOutput({ type: 'permission_mode_changed', permissionMode: 'yolo',
+    snapshot: { providerId: 'claude', revision: 1, status: 'executing' } });
+  await waitFor(() => expect(within(tab.dom.inputComposerEl).getByRole('button', { name: 'Permission mode: YOLO' })).toBeDefined());
+  h.backend.latest.complete();
+  await sending;
+  tab.dom.inputEl.value = 'Continue with the native permission';
+  const followUp = tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.backend.latest.requests).toHaveLength(2));
+  expect(h.backend.latest.requests[1].configuration.permissionMode).toBe('yolo');
+  h.backend.latest.complete();
+  await followUp;
+  tab.controllers.sideChatController.collapse();
+  const parentMode = within(tab.dom.inputComposerEl).getByRole('button', {
+    name: destination === 'side' ? 'Permission mode: Manual' : 'Permission mode: YOLO',
+  });
+  expect(parentMode).toBeDefined();
+  expect(await axe(parentMode)).toHaveNoViolations();
+  await destroyTab(tab);
+});
+
+it('returns unsent queued input when a completed response cannot be saved', async () => {
+  const h = setup();
+  const tab = await h.attach();
+  tab.controllers.drafts.restore('main', { content: 'First request' });
+  const sending = tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.backend.sessions[0]?.requests).toHaveLength(1));
+  tab.controllers.drafts.restore('main', { content: 'Queued follow-up' });
+  await tab.controllers.inputController.sendMessage();
+  const newerDraft = '    keepThisDraft()\n';
+  tab.controllers.drafts.restore('main', { content: newerDraft });
+  const saveError = new Error('Disk full');
+  jest.spyOn(h.plugin, 'updateConversation').mockRejectedValueOnce(saveError);
+  h.backend.latest.emitText('Completed response');
+  h.backend.latest.complete();
+  await expect(sending).rejects.toBe(saveError);
+
+  expect(tab.controllers.drafts.capture('main').content).toBe(`Queued follow-up\n\n${newerDraft}`);
+  expect(tab.state.queuedMessage).toBeNull();
+  expect(h.backend.latest.requests).toHaveLength(1);
+  expect(tab.state.hasPendingConversationSave).toBe(true);
+  expect(h.pool.isRunning('conversation')).toBe(false);
+  expect(tab.state.messages.some(message => message.contentBlocks?.some(block => block.type === 'text' && block.content === 'Completed response'))).toBe(true);
+  await destroyTab(tab);
 });

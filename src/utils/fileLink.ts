@@ -5,8 +5,8 @@
  * them clickable to open the file in Obsidian.
  */
 
-import type { App, WorkspaceLeaf } from 'obsidian';
-import { Notice } from 'obsidian';
+import type { App, PaneType, WorkspaceLeaf } from 'obsidian';
+import { Keymap, Notice } from 'obsidian';
 
 import { getVaultFileByPath } from './obsidianCompat';
 
@@ -21,7 +21,7 @@ import { getVaultFileByPath } from './obsidianCompat';
  *
  * Does NOT match image embeds ![[image.png]] (those are handled separately).
  */
-const WIKILINK_PATTERN_SOURCE = '(?<!!)\\[\\[([^\\]|#^]+)(?:#[^\\]|]+)?(?:\\^[^\\]|]+)?(?:\\|[^\\]]+)?\\]\\]';
+const WIKILINK_PATTERN_SOURCE = '(?<!!)\\[\\[([^\\]|#^]*)(?:#[^\\]|]+)?(?:\\^[^\\]|]+)?(?:\\|[^\\]]+)?\\]\\]';
 
 /** Creates a fresh regex instance to avoid global state issues */
 function createWikilinkPattern(): RegExp {
@@ -42,7 +42,7 @@ function buildWikilinkMatch(
   index: number
 ): WikilinkMatch {
   const pipeIndex = fullMatch.indexOf('|');
-  const displayText = pipeIndex > 0 ? fullMatch.slice(pipeIndex + 1, -2) : linkPath;
+  const displayText = pipeIndex > 0 ? fullMatch.slice(pipeIndex + 1, -2) : linkPath || extractLinkTarget(fullMatch);
 
   return {
     index,
@@ -64,11 +64,11 @@ function extractLinkTarget(fullMatch: string): string {
  * Sorted by index descending for end-to-start processing.
  */
 function findWikilinks(app: App, text: string, sourcePath: string): WikilinkMatch[] {
-  return parseWikilinks(text).filter(match => fileExistsInVault(app, match.linkPath, sourcePath));
+  return parseWikilinks(text, sourcePath).filter(match => fileExistsInVault(app, match.linkPath, sourcePath));
 }
 
-/** Parses wikilink source in descending offset order for text replacement. */
-export function parseWikilinks(text: string): WikilinkMatch[] {
+/** Parses source for text replacement; same-note targets need an explicit note context. */
+export function parseWikilinks(text: string, sourcePath = ''): WikilinkMatch[] {
   const pattern = createWikilinkPattern();
   const matches: WikilinkMatch[] = [];
 
@@ -76,6 +76,8 @@ export function parseWikilinks(text: string): WikilinkMatch[] {
   while ((match = pattern.exec(text)) !== null) {
     const fullMatch = match[0];
     const linkPath = match[1];
+    // A same-note target is meaningful only for a consumer with an explicit source.
+    if (!linkPath && (!sourcePath || !extractLinkTarget(fullMatch).startsWith('#'))) continue;
 
     matches.push(buildWikilinkMatch(fullMatch, linkPath, match.index));
   }
@@ -84,6 +86,7 @@ export function parseWikilinks(text: string): WikilinkMatch[] {
 }
 
 function fileExistsInVault(app: App, linkPath: string, sourcePath: string): boolean {
+  if (!linkPath) return !!sourcePath && !!getVaultFileByPath(app, sourcePath);
   const file = app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath);
   if (file) {
     return true;
@@ -144,9 +147,15 @@ function repairEmptyInternalLink(app: App, link: HTMLAnchorElement, sourcePath: 
   link.textContent = linkTarget;
 }
 
-async function openFileLink(app: App, linkTarget: string, sourcePath: string): Promise<void> {
+async function openFileLink(app: App, linkTarget: string, sourcePath: string, newPane: PaneType | boolean): Promise<void> {
+  if (newPane) {
+    await app.workspace.openLinkText(linkTarget, sourcePath, newPane);
+    return;
+  }
   const linkPath = extractLinkPathFromTarget(linkTarget);
-  const file = app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath);
+  const file = linkPath
+    ? app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath)
+    : sourcePath ? getVaultFileByPath(app, sourcePath) : null;
   let existingLeaf: WorkspaceLeaf | undefined;
   if (file) {
     app.workspace.iterateAllLeaves(leaf => {
@@ -175,6 +184,7 @@ export function registerFileLinkHandler(
   sourcePath = '',
 ): () => void {
   const handler = (event: MouseEvent) => {
+    if (event.type === 'auxclick' && event.button !== 1) return;
     const target = event.target as HTMLElement;
     // Handle both our links and Obsidian's internal links
     const link = target.closest('.claudian-file-link, .internal-link') as HTMLAnchorElement;
@@ -183,14 +193,18 @@ export function registerFileLinkHandler(
       event.preventDefault();
       const linkTarget = link.dataset.href || link.getAttribute('href');
       if (linkTarget) {
-        void openFileLink(app, linkTarget, sourcePath).catch(() => {
+        void openFileLink(app, linkTarget, sourcePath, Keymap.isModEvent(event)).catch(() => {
           new Notice('Failed to open file.');
         });
       }
     }
   };
   container.addEventListener('click', handler);
-  return () => container.removeEventListener('click', handler);
+  container.addEventListener('auxclick', handler);
+  return () => {
+    container.removeEventListener('click', handler);
+    container.removeEventListener('auxclick', handler);
+  };
 }
 
 function buildFragmentWithLinks(parent: HTMLElement, text: string, matches: WikilinkMatch[]): DocumentFragment {
