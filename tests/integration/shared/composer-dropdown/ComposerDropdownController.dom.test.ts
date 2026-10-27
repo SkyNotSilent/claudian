@@ -107,6 +107,28 @@ it('repositions fixed suggestions from their own window and releases that listen
     frame.remove();
   }
 });
+it.each(['\nNext paragraph', '\n\nNext paragraph', ' next words'])(
+  'preserves the prompt suffix %j when completing a mention immediately before it', async suffix => {
+    const container = document.body.createDiv();
+    const input = container.createEl('textarea', { attr: { 'aria-label': 'Message' } });
+    const mention = new MentionSource({ getCachedVaultFiles: () => [file('Alpha.md', 1)], getCachedVaultFolders: () => [] });
+    const controller = new ComposerDropdownController(container, input, [mention]);
+    input.value = `@Al${suffix}`;
+    input.setSelectionRange(3, 3);
+    controller.handleInputChange();
+    try {
+      const option = within(container).getByRole('option', { name: 'Alpha.md' });
+      expect(input.getAttribute('aria-activedescendant')).toBe(option.id);
+      expect(controller.handleKeydown(new KeyboardEvent('keydown', { key: 'Enter', cancelable: true }))).toBe(true);
+      expect(input.value).toBe(`@Alpha.md ${suffix.startsWith(' ') ? suffix.slice(1) : suffix}`);
+      expect(input.selectionStart).toBe('@Alpha.md '.length);
+      expect(controller.isVisible()).toBe(false);
+      expect(await axe(container)).toHaveNoViolations();
+    } finally {
+      controller.destroy(); mention.destroy(); container.remove();
+    }
+  },
+);
 
 describe.each([false, true])('local suggestion scrolling (fixed: %s)', fixed => {
   const nativeScroll = Element.prototype.scrollIntoView;

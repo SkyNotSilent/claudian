@@ -315,12 +315,12 @@ describe('projects section', () => {
     ui.surface.dispose();
   });
 
-  it('heads the projects with New project and a sort menu, without a By project organization', async () => {
-    const { host, plugin, region, settings, view } = createProjectSurface();
+  it('heads the projects with New project only, without a By project organization', async () => {
+    const { host, plugin, region, view } = createProjectSurface();
     const projectToggles = () => within(region()).getAllByRole('button', { expanded: false })
       .map(toggle => toggle.textContent);
-    // Projects start collapsed, above the sessions.
-    expect(projectToggles()).toEqual([sectionName('Launch', 1), sectionName('Empty', 0)]);
+    // Projects start collapsed, above the sessions, newest first until the user reorders them.
+    expect(projectToggles()).toEqual([sectionName('Empty', 0), sectionName('Launch', 1)]);
     expect(within(view.getByRole('region', { name: 'Sessions' })).queryByText('Member session')).toBeNull();
 
     const newProject = within(region()).getByRole('button', { name: t('chat.projects.newProjectAction') });
@@ -330,16 +330,10 @@ describe('projects section', () => {
     expect(createProject).toHaveBeenCalledWith(plugin);
     expect((await axe(host)).violations).toEqual([]);
 
-    fireEvent.click(within(region()).getByRole('button', { name: t('chat.projects.options') }));
-    const sortMenu = menus().at(-1)!;
-    expect(sortMenu.items.map(entry => entry.title)).toEqual([
-      t('chat.projects.sortBy'), t('chat.projects.sort.lastActivity'), t('chat.projects.sort.created'),
-    ]);
-    expect(sortMenu.items.find(entry => entry.title === t('chat.projects.sort.lastActivity'))!.checked).toBe(true);
-    sortMenu.items.find(entry => entry.title === t('chat.projects.sort.created'))!.clickHandler!();
-    await Promise.resolve();
-    expect(settings.projectSort).toBe('created');
-    expect(projectToggles()).toEqual([sectionName('Empty', 0), sectionName('Launch', 1)]);
+    // Projects keep the user's dragged order, so the header has no sort menu.
+    const header = region().querySelector<HTMLElement>('.claudian-session-projects-header')!;
+    expect(within(header).getAllByRole('button').map(button => button.getAttribute('aria-label') ?? button.textContent))
+      .toEqual([t('chat.projects.header'), t('chat.projects.newProjectAction')]);
 
     fireEvent.click(view.getByRole('button', { name: 'Session options' }));
     const sessionMenu = menus().at(-1)!;
@@ -361,11 +355,9 @@ describe('projects section', () => {
 
     // Same header actions and collapsed project rows as the sidebar.
     expect(projects().getAllByRole('button', { expanded: false }).map(toggle => toggle.textContent))
-      .toEqual([sectionName('Launch', 1), sectionName('Empty', 0)]);
+      .toEqual([sectionName('Empty', 0), sectionName('Launch', 1)]);
     fireEvent.click(projects().getByRole('button', { name: t('chat.projects.newProjectAction') }));
     expect(createProject).toHaveBeenCalledWith(plugin);
-    fireEvent.click(projects().getByRole('button', { name: t('chat.projects.options') }));
-    expect(titles()[0]).toBe(t('chat.projects.sortBy'));
     // Members leave the session list; without a Pinned section, pinned sessions stay in it.
     const sessions = within(history().getByRole('region', { name: 'Sessions' }));
     expect(sessions.queryByText('Member session')).toBeNull();
@@ -418,6 +410,33 @@ describe('projects section', () => {
       fireEvent.click(within(menuEl).getByRole('button', { name: sectionName('Launch', 1) }));
       expect(within(menuEl).getByText('Member session')).toBeTruthy();
       expect(launchHeader().getBoundingClientRect().top).toBe(before);
+    } finally {
+      layout.mockRestore();
+    }
+  });
+
+  it('keeps the wide session list at the top when newer sessions load above it, as after startup', () => {
+    const { host, plugin, surface } = createProjectSurface();
+    const sessionList = () => host.querySelector<HTMLElement>('.claudian-session-list-items')!;
+    // jsdom has no layout: stack every session row 40px tall in document order.
+    const layout = jest.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const list = sessionList();
+      const index = Array.from(list.querySelectorAll<HTMLElement>('.claudian-history-item, .claudian-session-group-header')).indexOf(this);
+      const top = this === list ? 0 : index * 40 - list.scrollTop;
+      const height = this === list ? 400 : index < 0 ? 0 : 40;
+      return { top, bottom: top + height, height, left: 0, right: 300, width: 300 } as DOMRect;
+    });
+    try {
+      const newer = (minutes: number) => conversation(`newer-${minutes}`, { lastActivityAt: testDate({ minutes }).getTime() });
+      plugin.getConversationList().push(...Array.from({ length: 20 }, (_, index) => newer(-index)));
+      surface.invalidate();
+      expect(sessionList().scrollTop).toBe(0);
+
+      // A scrolled list keeps its first visible row in place instead.
+      sessionList().scrollTop = 80;
+      plugin.getConversationList().push(newer(1));
+      surface.invalidate();
+      expect(sessionList().scrollTop).toBe(120);
     } finally {
       layout.mockRestore();
     }
@@ -483,7 +502,6 @@ describe('projects section', () => {
     expect(sessionRow()).not.toBeNull();
 
     // The header actions sit beside the toggle and never collapse their section.
-    fireEvent.click(within(region()).getByRole('button', { name: t('chat.projects.options') }));
     fireEvent.click(within(region()).getByRole('button', { name: t('chat.projects.newProjectAction') }));
     fireEvent.click(within(sessions()).getByRole('button', { name: 'Session options' }));
     fireEvent.click(within(sessions()).getByRole('button', { name: 'Collapse all groups' }));
