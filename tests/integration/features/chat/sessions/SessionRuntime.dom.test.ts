@@ -16,6 +16,8 @@ import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import type { ClaudianSettings, Conversation, ConversationMutablePatch } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import { getChatSettingsSnapshot } from '@/features/chat/ChatSettings';
+import { getSessionSettingsSnapshot, updateSessionProviderSettings, updateSessionReasoning } from '@/features/chat/sessions/sessionSettings';
 import { activateTab, destroyTab } from '@/features/chat/tabs/TabLifecycle';
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import { t } from '@/i18n/i18n';
@@ -357,6 +359,37 @@ it('retains failed queued reference preparation as session recovery after its ta
   await destroyTab(second);
 });
 
+it('preserves raw drafts when multiple reference preparations recover after detachment', async () => {
+  const h = setup();
+  const first = await h.attach();
+  first.controllers.drafts.restore('main', { content: 'First request' });
+  const sending = first.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.backend.sessions[0]?.requests).toHaveLength(1));
+  const reference = deferred<Conversation | null>();
+  jest.mocked(h.plugin.getConversationById)
+    .mockImplementationOnce(() => reference.promise)
+    .mockResolvedValueOnce(null);
+  const firstDraft = '    keepIndented()\n\n@[First](claudian-session:conv-1-source)  \n';
+  first.controllers.drafts.restore('main', { content: firstDraft });
+  const preparingFirst = first.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.plugin.getConversationById).toHaveBeenCalledWith('conv-1-source'));
+  const secondDraft = '@[Second](claudian-session:conv-2-source)';
+  first.controllers.drafts.restore('main', { content: secondDraft });
+  const preparingSecond = first.controllers.inputController.sendMessage();
+  await destroyTab(first);
+  h.backend.latest.complete();
+  await sending;
+  reference.resolve(null);
+  await Promise.all([preparingFirst, preparingSecond]);
+
+  expect(first.session.runtime.model.composer.hasRecovery).toBe(true);
+  const second = await h.attach();
+  expect(second.controllers.drafts.capture('main').content).toBe(`${secondDraft}\n\n${firstDraft}`);
+  expect(h.backend.latest.requests).toHaveLength(1);
+  expect(second.session.runtime.model.composer.hasRecovery).toBe(false);
+  await destroyTab(second);
+});
+
 it('fences a detached side queue synchronously before the plugin shutdown drain', async () => {
   const h = setup();
   const first = await h.attach();
@@ -508,6 +541,31 @@ it('publishes session status only when its list projection changes', async () =>
   await sending;
   expect(h.pool.isRunning('conversation')).toBe(false);
   expect(h.statusChanges).toHaveBeenCalled();
+  await destroyTab(tab);
+});
+
+it('keeps a newer composer draft when first conversation creation fails', async () => {
+  const h = setup();
+  const creating = deferred<Conversation>();
+  Object.assign(h.plugin, { createConversation: jest.fn(() => creating.promise) });
+  Object.assign(h.plugin.app.workspace, { getActiveFile: () => null });
+  const tab = await h.attach({ blank: true });
+  tab.controllers.drafts.restore('main', { content: 'First request' });
+  const sending = tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.plugin.createConversation).toHaveBeenCalled());
+  const newerDraft = '    followUp()\n';
+  const newerImage = { id: 'new-image', name: 'next.png', mediaType: 'image/png' as const,
+    data: 'bmV4dA==', size: 4, source: 'paste' as const };
+  tab.controllers.drafts.restore('main', { content: newerDraft, images: [newerImage] });
+  creating.reject(new Error('Disk full'));
+  await Promise.allSettled([sending]);
+
+  expect(tab.controllers.drafts.capture('main')).toEqual({
+    content: `First request\n\n${newerDraft}`, images: [newerImage],
+  });
+  expect(tab.state.messages).toEqual([]);
+  expect(tab.state.currentConversationId).toBeNull();
+  expect(h.backend.sessions.flatMap(session => session.requests)).toEqual([]);
   await destroyTab(tab);
 });
 
@@ -847,6 +905,53 @@ it('rematches an open mention after editing queued input back into the composer'
     await destroyTab(tab);
     await h.pool.dispose();
   }
+});
+
+it('copies the parent session selections into a new side chat after another session changes preferences', async () => {
+  const h = setup();
+  const tab = await h.attach();
+  const runtime = tab.session.runtime;
+  tab.state.messages = [
+    { id: 'parent-user', role: 'user', content: 'Parent task', timestamp: testDate().getTime() },
+    { id: 'parent-answer', role: 'assistant', content: 'Parent answer', assistantMessageId: 'checkpoint', timestamp: testDate().getTime() },
+  ];
+  await updateSessionProviderSettings(runtime, h.plugin, settings => {
+    settings.permissionMode = 'manual'; settings.serviceTier = 'fast';
+  });
+  await updateSessionReasoning(runtime, h.plugin, 'low');
+  const other = h.pool.ensure({ conversationId: 'other-conversation', providerId: 'claude', draftModel: null });
+  await updateSessionProviderSettings(other, h.plugin, settings => {
+    settings.permissionMode = 'yolo'; settings.serviceTier = 'default';
+  });
+  await updateSessionReasoning(other, h.plugin, 'high');
+  expect(getSessionSettingsSnapshot(runtime, h.plugin)).toMatchObject({
+    permissionMode: 'manual', reasoning: 'low', serviceTier: 'fast',
+  });
+  jest.spyOn(ProviderRegistry.getConversationHistoryService('claude'), 'buildForkProviderState').mockResolvedValue({});
+  const sending = tab.controllers.sideChatController.handleCommandSubmission('Explore independently', []);
+  await waitFor(() => expect(h.backend.sessions[0]?.requests).toHaveLength(1));
+  const configuration = h.backend.latest.requests[0].configuration;
+  h.backend.latest.complete();
+  await sending;
+  expect(configuration).toMatchObject({ permissionMode: 'manual', reasoning: 'low', serviceTier: 'fast' });
+  expect(getChatSettingsSnapshot(h.plugin.settings, 'claude', 'claude-sonnet-4-5')).toMatchObject({
+    permissionMode: 'yolo', reasoning: 'high', serviceTier: 'default',
+  });
+  await updateSessionProviderSettings(runtime, h.plugin, settings => {
+    settings.permissionMode = 'normal'; settings.serviceTier = 'default';
+  });
+  await updateSessionReasoning(runtime, h.plugin, 'high');
+  const followUp = tab.controllers.sideChatController.submitToSide('Continue the child', []);
+  await waitFor(() => expect(h.backend.latest.requests).toHaveLength(2));
+  h.backend.latest.complete();
+  await followUp;
+  expect(h.backend.latest.requests[1].configuration).toMatchObject({
+    permissionMode: 'manual', reasoning: 'low', serviceTier: 'fast',
+  });
+  expect(getSessionSettingsSnapshot(other, h.plugin)).toMatchObject({
+    permissionMode: 'yolo', reasoning: 'high', serviceTier: 'default',
+  });
+  await destroyTab(tab);
 });
 
 it('keeps archived sessions out of the composer resume picker', async () => {
