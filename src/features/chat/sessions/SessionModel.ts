@@ -210,14 +210,7 @@ export class SessionModel {
       persistence: this.conversationController,
       createMessageId: createSessionMessageId,
       captureReviewableSettlement: outcome => this.captureReview(outcome),
-      updatePermissionMode: async mode => {
-        await updateSessionProviderSettings(session, plugin, settings => {
-          const ui = getSessionChatUIConfig(session, plugin);
-          if (ui.applyPermissionMode) ui.applyPermissionMode(mode, settings);
-          else settings.permissionMode = mode;
-        });
-        this.publish('settings');
-      },
+      updatePermissionMode: mode => this.updatePermissionMode(mode),
       receiveSuggestion: (id, suggestion) => {
         if (this.presentation?.isVisible()) this.presentation.suggestions.receive(id, suggestion);
       },
@@ -255,6 +248,16 @@ export class SessionModel {
     return !this.presentation && !this.hydration && this.titleWork.size === 0 && !this.recovery.hasPendingWork
       && !this.conversationController.hasPendingPersistence && !this.conversationController.hasBranchDraft
       && (!this.composer.hasRecovery || !this.session.conversationId);
+  }
+
+  /** Applies native permission changes through the same owner as toolbar selections. */
+  async updatePermissionMode(mode: string): Promise<void> {
+    await updateSessionProviderSettings(this.session, this.plugin, settings => {
+      const ui = getSessionChatUIConfig(this.session, this.plugin);
+      if (ui.applyPermissionMode) ui.applyPermissionMode(mode, settings);
+      else settings.permissionMode = mode;
+    });
+    this.publish('settings');
   }
 
   syncProvider(): void {
@@ -380,6 +383,7 @@ export function createSessionSideChat(session: ChatSessionRuntime, plugin: ChatF
       get providerId() { return session.providerId; },
       get isLive() { return !session.isDisposed; },
       get isStreaming() { return session.turns.isInFlight; },
+      getSettings: () => getSessionSettingsSnapshot(session, plugin),
       // Transcript reads hold a hydrated model; an evicted parent must not answer from an empty one.
       readLatestForkCheckpoint: () => session.withModel(async model => findLatestForkCheckpoint(model.state.messages)),
       captureForkSource: async () => {
@@ -403,5 +407,6 @@ export function createSessionSideChat(session: ChatSessionRuntime, plugin: ChatF
       model.publish('destination');
     },
     onStatusChanged: () => session.notifyChanged(),
+    onSettingsChanged: () => session.peekModel?.publish('settings'),
   });
 }
