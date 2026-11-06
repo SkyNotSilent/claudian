@@ -1,5 +1,6 @@
 /** @vitest-environment jsdom */
 import { axe } from '@test/helpers/accessibility';
+import { deferred } from '@test/helpers/ChatExecutionHarness';
 import { claudeCatalogFixture } from '@test/helpers/claudeModels';
 import { TEST_CODEX_CATALOG } from '@test/helpers/codexModels';
 import { createFeatureHostFixture } from '@test/helpers/FeatureHostFixture';
@@ -31,6 +32,7 @@ async function createSettings(
   overrides: Partial<ClaudianSettings> = {},
   beforePersist = async () => {},
   onCommit = (_settings: Readonly<ClaudianSettings>) => {},
+  afterPublish?: () => void,
 ) {
   const persist = vi.fn(beforePersist);
   const fixture = await createFeatureHostFixture({
@@ -42,6 +44,7 @@ async function createSettings(
       },
     },
     beforePersist: persist,
+    afterPublish,
   });
   const { host, settings, coordinator, vault } = fixture;
   const getAdapter = vi.spyOn(fixture.storage, 'getAdapter');
@@ -94,6 +97,65 @@ it('renders the declarative settings surface and loads real skills only on first
   fireEvent.click(within(h.container).getByRole('button', { name: t('settings.tabs.skills') }));
   expect(within(h.container).getAllByText('local')).toHaveLength(1);
   expect(h.getAdapter).toHaveBeenCalledTimes(1);
+});
+
+it('persists the automatic linked-content preference through the named General toggle', async () => {
+  const h = await createSettings();
+  const toggle = within(h.container).getByRole('switch', { name: 'Automatically link active note in new chats' });
+  expect(toggle.getAttribute('aria-checked')).toBe('true');
+  fireEvent.click(toggle);
+  await controlChangeSettled(toggle);
+  expect(h.settings.autoLinkActiveNote).toBe(false);
+  expect((await h.storage.load()).autoLinkActiveNote).toBe(false);
+  expect(await axe(h.container)).toHaveNoViolations();
+});
+
+it('restores a failed automatic-link preference without writing its projection and can retry', async () => {
+  const h = await createSettings();
+  h.persist.mockRejectedValueOnce(new Error('Disk full'));
+  const toggle = within(h.container).getByRole('switch', { name: 'Automatically link active note in new chats' });
+  fireEvent.click(toggle);
+  await expect(controlChangeSettled(toggle)).rejects.toThrow('Disk full');
+  expect(h.settings.autoLinkActiveNote).toBe(true);
+  expect(toggle.getAttribute('aria-checked')).toBe('true');
+  expect(h.mutations).toHaveBeenCalledTimes(1);
+  expect(h.persist).toHaveBeenCalledTimes(1);
+  fireEvent.click(toggle);
+  await controlChangeSettled(toggle);
+  expect(h.mutations).toHaveBeenCalledTimes(2);
+  expect((await h.storage.load()).autoLinkActiveNote).toBe(false);
+  expect(toggle.getAttribute('aria-checked')).toBe('false');
+});
+
+it('retains the committed automatic-link value when post-commit publication fails', async () => {
+  const h = await createSettings({}, undefined, undefined, () => { throw new Error('Publication failed'); });
+  const toggle = within(h.container).getByRole('switch', { name: 'Automatically link active note in new chats' });
+  fireEvent.click(toggle);
+  await expect(controlChangeSettled(toggle)).rejects.toThrow('Settings were persisted');
+  expect(h.mutations).toHaveBeenCalledTimes(1);
+  expect(h.settings.autoLinkActiveNote).toBe(false);
+  expect((await h.storage.load()).autoLinkActiveNote).toBe(false);
+  expect(toggle.getAttribute('aria-checked')).toBe('false');
+});
+
+it('retains two automatic-link clicks while the first settings write is held', async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const h = await createSettings({}, async () => { entered.resolve(); await release.promise; });
+  const toggle = within(h.container).getByRole('switch', { name: 'Automatically link active note in new chats' });
+  fireEvent.click(toggle);
+  const first = controlChangeSettled(toggle);
+  try {
+    await entered.promise;
+    fireEvent.click(toggle);
+    expect(h.mutations).toHaveBeenCalledTimes(2);
+  } finally { release.resolve(); }
+  await Promise.all([first, controlChangeSettled(toggle)]);
+  expect(h.mutations).toHaveBeenCalledTimes(2);
+  expect(h.persist).toHaveBeenCalledTimes(2);
+  expect(h.settings.autoLinkActiveNote).toBe(true);
+  expect((await h.storage.load()).autoLinkActiveNote).toBe(true);
+  expect(toggle.getAttribute('aria-checked')).toBe('true');
 });
 
 it('persists dual-pane changes before rerendering the available display controls', async () => {
@@ -250,4 +312,61 @@ it('updates a disabled provider surface from its committed enablement notificati
   expect(h.notifications).toEqual(['codex']);
   expect(within(titleModels).getByRole('option', { name: 'Codex: GPT-5.5' })).toBeDefined();
   expect(within(h.container).queryByRole('status')).toBeNull();
+});
+
+
+it.each(['success', 'failure'] as const)('retains hidden-command drafts when settings reopen before save %s', async phase => {
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let writes = 0;
+  const h = await createSettings({ hiddenCommands: ['compact'] }, async () => {
+    if (++writes === 1) {
+      entered();
+      await pending;
+      if (phase === 'failure') throw new Error('Disk unavailable');
+    }
+  });
+  fireEvent.click(within(h.container).getByRole('button', { name: t('settings.tabs.skills') }));
+  const input = within(h.container).getByRole<HTMLTextAreaElement>('textbox', { name: t('settings.skills.hidden.name') });
+  fireEvent.input(input, { target: { value: 'compact\nreview' } });
+  fireEvent.blur(input);
+  try {
+    await started;
+    expect(h.settings.hiddenCommands).toEqual(['compact']);
+    h.tab.update();
+    const reopened = within(h.container).getByRole<HTMLTextAreaElement>('textbox', { name: t('settings.skills.hidden.name') });
+    expect(reopened.value).toBe('compact\nreview');
+  } finally {
+    release();
+  }
+  const saved = await h.tab['textEdits'].flush();
+  expect(saved).toBe(phase === 'success');
+  const reopened = within(h.container).getByRole<HTMLTextAreaElement>('textbox', { name: t('settings.skills.hidden.name') });
+  expect(reopened.value).toBe('compact\nreview');
+  expect(h.settings.hiddenCommands).toEqual(phase === 'success' ? ['compact', 'review'] : ['compact']);
+  fireEvent.blur(reopened);
+  expect(await h.tab['textEdits'].flush()).toBe(true);
+  expect((await h.storage.load()).hiddenCommands).toEqual(['compact', 'review']);
+  expect(writes).toBe(phase === 'success' ? 1 : 2);
+});
+
+it.each([false, true])('offers workspace conversation titles as an accessible opt-in and restores the committed value on save failure=%s', async fail => {
+  let rejectSave = fail;
+  const h = await createSettings({}, async () => { if (rejectSave) throw new Error('Settings write failed'); });
+  try {
+    const control = within(h.container).getByRole('switch', { name: 'Show conversation title in Obsidian tabs' });
+    expect(control.getAttribute('aria-checked')).toBe('false');
+    expect(await axe(control.closest<HTMLElement>('.setting-item')!)).toHaveNoViolations();
+    fireEvent.click(control);
+    const outcome = await controlChangeSettled(control).then(() => 'saved', (error: Error) => error.message);
+    expect(outcome).toBe(fail ? 'Settings write failed' : 'saved');
+    expect(h.mutations).toHaveBeenCalledTimes(1);
+    expect(h.persist).toHaveBeenCalledTimes(1);
+    expect(control.getAttribute('aria-checked')).toBe(String(!fail));
+    expect((await h.storage.load()).showConversationTitleInWorkspace).toBe(!fail);
+  } finally {
+    rejectSave = false;
+  }
 });

@@ -1,5 +1,7 @@
 /** @vitest-environment jsdom */
 
+import { runInNewContext } from 'node:vm';
+
 import { axe } from '@test/helpers/accessibility';
 import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
 import { parseCodexSessionContent } from '@test/helpers/providers/codex/parseCodexSessionContent';
@@ -301,6 +303,8 @@ describe.each(['live', 'history'] as const)('%s Codex tool presentation', mode =
     it.each([
       ['string arguments', { id: 'mcp-args', status: 'completed', arguments: '{"query":"vault notes"}', result: { content: [{ type: 'text', text: 'hit' }] } },
         { input: { query: 'vault notes' }, status: 'completed', result: 'hit' }],
+      ['structured-only content', { id: 'mcp-structured', status: 'completed', arguments: {}, result: { content: [], structuredContent: { matches: ['vault note'], count: 1 } } },
+        { input: {}, status: 'completed', result: '{\n  "matches": [\n    "vault note"\n  ],\n  "count": 1\n}' }],
       ['cancellation', { id: 'mcp-cancelled', status: 'cancelled', arguments: { query: 'vault notes' } },
         { input: { query: 'vault notes' }, status: 'error', result: 'Failed' }],
       ['error text', { id: 'mcp-error', status: 'completed', arguments: {}, error: 'Server disconnected' },
@@ -320,6 +324,28 @@ describe.each(['live', 'history'] as const)('%s Codex tool presentation', mode =
     expect(tools).toEqual([expect.objectContaining({
       id: mode === 'history' ? 'tail-ws-0' : `search-${status}`, name: 'WebSearch', input: { actionType: 'search', query: 'vault sync' }, status: expectedStatus, result: 'Search complete',
     })]);
+  });
+
+  it('keeps native secret question answers masked in completed cards', async () => {
+    const answer = 'sample-sensitive-token-123';
+    const output = JSON.stringify({ answers: { token: { answers: [answer] } } });
+    const tool = restoreTool(mode, 'request_user_input', {
+      questions: [{ id: 'token', header: 'Token', question: 'Enter API token',
+        isSecret: true, isOther: true, options: [{ label: 'Use a token', description: 'Authenticate' }] }],
+    }, output);
+    const parent = document.body.createDiv();
+    try {
+      const card = mode === 'live'
+        ? renderToolCall(parent, { ...tool, status: 'running', result: undefined }, { initiallyExpanded: true })
+        : renderStoredToolCall(parent, tool, { initiallyExpanded: true });
+      if (mode === 'live') updateToolCallResult(card, tool);
+      expect(within(card).getByText('Enter API token')).toBeDefined();
+      expect(within(card).getByText('••••••••')).toBeDefined();
+      expect(card.textContent).not.toContain(answer);
+      expect(tool.result).toBe(output);
+      expect(tool.resolvedAnswers?.token).toBe(answer);
+      expect(await axe(parent)).toHaveNoViolations();
+    } finally { parent.remove(); }
   });
 
   it('renders async question acknowledgement with the original question and options', async () => {
@@ -647,5 +673,130 @@ it.each([false, true].flatMap(lateNative => ['text', 'thinking'].map(boundary =>
   } finally {
     stream.dispose(); subagents.clear(); renderer.dispose();
     vi.useRealTimers();
+  }
+});
+
+
+it.each(['inline', 'fenced', 'indented', 'leading indented'] as const)('keeps %s question-reply code visible without answering a native question', form => {
+  const tool = restoreTool('history', 'request_user_input_async', { questions: [{ title: 'Which check?', options: ['History'] }] });
+  const reply = formatCodexQuestionReply(tool, { '0': 'History' })!.content;
+  const text = form === 'inline' ? `Explain \`${reply.replace(/\n/g, ' ')}\`.`
+    : form === 'fenced' ? `Explain this example:\n\`\`\`xml\n${reply}\n\`\`\``
+      : `${form === 'indented' ? 'Explain this example:\n\n' : ''}${reply.split('\n').map(line => `    ${line}`).join('\n')}`;
+  const chunks: StreamChunk[] = [];
+  const router = new CodexNotificationRouter(chunk => chunks.push(chunk), '/workspace');
+  router.beginTurn();
+  router.handleNotification('item/started', { item: { type: 'userMessage', id: 'literal-example', content: [{ type: 'text', text }] } });
+  expect.soft(chunks.filter(chunk => chunk.type === 'user_message_start')).toEqual([
+    { type: 'user_message_start', itemId: 'literal-example', content: text },
+  ]);
+  const messages = parseCodexSessionContent([
+    { type: 'function_call', name: 'request_user_input_async', call_id: 'tool', arguments: JSON.stringify({ questions: [{ title: 'Which check?', options: ['History'] }] }) },
+    { type: 'function_call_output', call_id: 'tool', output: '{"accepted":true}' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+  ].map((payload, seconds) => JSON.stringify({ type: 'response_item', timestamp: testTime({ seconds }), payload })).join('\n'));
+  expect.soft(messages.find(message => message.role === 'user')?.content).toBe(text);
+  expect.soft(messages.flatMap(message => message.toolCalls ?? [])[0].resolvedAnswers).toBeUndefined();
+});
+
+
+it('distinguishes question-reply code from an actual reply merged after the example', () => {
+  const tool = restoreTool('history', 'request_user_input_async', { questions: [{ title: 'Which check?', options: ['History', 'CLI'] }] });
+  const example = `Explain this example:\n\`\`\`xml\n${formatCodexQuestionReply(tool, { '0': 'History' })!.content}\n\`\`\``;
+  const text = `${example}\n\n${formatCodexQuestionReply(tool, { '0': 'CLI' })!.content}`;
+  const chunks: StreamChunk[] = [];
+  const router = new CodexNotificationRouter(chunk => chunks.push(chunk), '/workspace');
+  router.beginTurn();
+  router.handleNotification('item/started', { item: { type: 'userMessage', id: 'mixed-example', content: [{ type: 'text', text }] } });
+  expect(chunks.filter(chunk => chunk.type === 'user_message_start')).toEqual([
+    { type: 'user_message_start', itemId: 'mixed-example', content: example },
+  ]);
+  const messages = parseCodexSessionContent([
+    { type: 'function_call', name: 'request_user_input_async', call_id: 'tool', arguments: JSON.stringify({ questions: [{ title: 'Which check?', options: ['History', 'CLI'] }] }) },
+    { type: 'function_call_output', call_id: 'tool', output: '{"accepted":true}' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+  ].map((payload, seconds) => JSON.stringify({ type: 'response_item', timestamp: testTime({ seconds }), payload })).join('\n'));
+  expect(messages.find(message => message.role === 'user')?.displayContent).toBe(example);
+  expect(messages.flatMap(message => message.toolCalls ?? [])[0].resolvedAnswers).toEqual({ '0': 'CLI' });
+});
+
+it.each(['live', 'history'] as const)('keeps quoted delimiters as command data in %s code-mode tools', mode => {
+  for (const directory of [')', '(', '{', '}']) {
+    const command = 'pwd';
+    const source = `text(await tools.exec_command({cmd:${JSON.stringify(command)},workdir:${JSON.stringify(directory)}}));`;
+    const tools = restoreSession(mode, [
+      { raw: { type: 'custom_tool_call', name: 'exec', call_id: 'script', input: source } },
+      { raw: { type: 'custom_tool_call_output', call_id: 'script', output: 'Script completed\nOutput:\nfinished' } },
+    ]);
+    expect(tools).toMatchObject([{ name: 'Bash', input: { command } }]);
+  }
+});
+
+it.each(['live', 'history'] as const)('retains unsupported JavaScript string escapes as the original script in %s', mode => {
+  for (const argument of [String.raw`'cat caf\u00e9.md'`, String.raw`'printf "\x1b"'`, "'echo a\\\nb'"]) {
+    const source = `text(await tools.exec_command({cmd:${argument}}));`;
+    const tools = restoreSession(mode, [
+      { raw: { type: 'custom_tool_call', name: 'exec', call_id: 'script', input: source } },
+      { raw: { type: 'custom_tool_call_output', call_id: 'script', output: 'Script completed\nOutput:\nfinished' } },
+    ]);
+    expect(tools).toMatchObject([{ name: 'exec', input: { raw: source } }]);
+  }
+  const supported = String.raw`text(await tools.exec_command({cmd:'printf \'ok\'\n'}));`;
+  const tools = restoreSession(mode, [
+    { raw: { type: 'custom_tool_call', name: 'exec', call_id: 'supported', input: supported } },
+    { raw: { type: 'custom_tool_call_output', call_id: 'supported', output: 'Script completed\nOutput:\nfinished' } },
+  ]);
+  expect(tools).toMatchObject([{ name: 'Bash', input: { command: "printf 'ok'\n" } }]);
+});
+
+
+describe.each(['live', 'history'] as const)('code-mode patch bindings in %s', mode => {
+  it.each(['reassigned binding', 'transformed initializer', 'transformed argument', 'shadowed parameter'] as const)('retains the original script for a %s', async kind => {
+    const original = '*** Begin Patch\n*** Add File: old.md\n+note\n*** End Patch';
+    const final = '*** Begin Patch\n*** Add File: new.md\n+note\n*** End Patch';
+    const source = kind === 'reassigned binding'
+      ? `let patch = ${JSON.stringify(original)}; patch = ${JSON.stringify(final)}; text(await tools.apply_patch(patch));`
+      : kind === 'transformed initializer'
+        ? `const patch = ${JSON.stringify(original)}.replace('old.md', 'new.md'); text(await tools.apply_patch(patch));`
+        : kind === 'transformed argument'
+          ? `text(await tools.apply_patch(${JSON.stringify(original)}.replace('old.md', 'new.md')));`
+          : `const patch = ${JSON.stringify(original)}; async function apply(patch) { return tools.apply_patch(patch); } text(await apply(${JSON.stringify(final)}));`;
+    const applied: string[] = [];
+    await runInNewContext(`(async () => { ${source} })()`, {
+      tools: { apply_patch: (patch: string) => { applied.push(patch); return 'Success'; } },
+      text: () => undefined,
+    });
+    expect(applied).toEqual([final]);
+    const tools = restoreSession(mode, [
+      { raw: { type: 'custom_tool_call', name: 'exec', call_id: 'changed-patch', input: source } },
+      { raw: { type: 'custom_tool_call_output', call_id: 'changed-patch', output: 'Script completed\nWall time 0.1 seconds\nOutput:\nSuccess' } },
+    ]);
+    expect(tools).toMatchObject([{ name: 'exec', input: { raw: source } }]);
+  });
+});
+
+it('shows structured-only native MCP output and preserves text/error precedence', async () => {
+  const data = { matches: ['vault note'], count: 1 };
+  const structured = restoreNativeMcpTool({ id: 'structured', status: 'completed', result: { content: [], structuredContent: data } })[0];
+  const block = renderStoredToolCall(document.body.createDiv(), structured, { initiallyExpanded: true });
+  expect(within(block).getByText(/vault note/).textContent).toContain('vault note');
+  expect((await axe(block)).violations).toEqual([]);
+  for (const [content, error, expected] of [
+    [[{ type: 'text', text: 'Human-readable result' }], undefined, 'Human-readable result'],
+    [[], 'Server disconnected', 'Server disconnected'],
+  ] as const) {
+    const tool = restoreNativeMcpTool({ id: 'precedence', status: 'completed', error,
+      result: { content, structuredContent: data } })[0];
+    expect(tool.result).toBe(expected);
+    expect(tool.status).toBe(error ? 'error' : 'completed');
+  }
+});
+
+it.each(['live', 'history'] as const)('shows signed native command exits as failures in %s', mode => {
+  for (const exitCode of [-1, 0, 7]) {
+    const tool = restoreTool(mode, 'exec_command', { cmd: 'sleep 30' },
+      `Process exited with code ${exitCode}\nOutput:\n${exitCode < 0 ? 'command aborted by user' : 'note output'}`);
+    expect(tool.status).toBe(exitCode === 0 ? 'completed' : 'error');
+    expect(tool.result).toBe(exitCode < 0 ? 'command aborted by user' : 'note output');
   }
 });

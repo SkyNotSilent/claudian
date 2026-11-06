@@ -19,9 +19,9 @@ An Obsidian plugin that embeds AI coding agents (Claude Code, Codex, Grok Build,
 
 ## Features & Usage
 
-Open Claudian interface from the ribbon icon or command palette. Everything works like your familiar coding agent, Claude Code, Codex, Grok Build, Antigravity CLI, OpenCode, Pi, and DeepSeek Harness — talk to the agent, and it reads, writes, edits, searches and run commands in your vault.
+Open Claudian interface from the ribbon icon or the **Claudian: Open chat view** command. Bind a hotkey to this command to open or reveal the chat and focus its input; running it again keeps the chat open. Everything works like your familiar coding agent, Claude Code, Codex, Grok Build, Antigravity CLI, OpenCode, Pi, and DeepSeek Harness — talk to the agent, and it reads, writes, edits, searches and run commands in your vault.
 
-**Inline Edit** — Select text or start at the cursor position + hotkey to edit directly in notes with word-level diff preview.
+**Inline Edit** — Replace selected text or insert at the cursor, review the Markdown diff, and accept or reject the change. Choose a separate model for inline edits. See the [Inline edit guide](docs/inline-edit.md).
 
 **Projects** — Group sessions that work toward a shared goal. Every member shares the project's instructions and a memory file that the agents keep current, and the agents can cooperate by finding, reading and messaging each other. See the [Projects guide](docs/projects.md).
 
@@ -29,15 +29,21 @@ Open Claudian interface from the ribbon icon or command palette. Everything work
 
 **Slash Commands & Skills** — Type `/` or `$` for reusable prompt templates or Skills from user- and vault-level scopes.
 
+**Linked Content** — New chats automatically link the active note. Turn off **Settings → Claudian → General → Automatically link active note in new chats** to start without a link; the welcome-screen selector still lets you choose a note or folder explicitly. This preference does not change existing conversations or their fixed Linked content.
+
 **@mention** — Type `@` to reference vault files, folders and other Claudian sessions.
 
 **Cross-Session Messaging** — Let agents read, message, steer or interrupt other Claudian sessions, or start new ones on any provider. See the [Cross-session messaging guide](docs/cross-session-messaging.md).
 
 **Side Chat (`/side` or `/btw`)** — Explore a separate, temporary conversation with follow-ups and tools while keeping the main chat unchanged.
 
+**Environment Snippets** — Save reusable runtime configurations and insert them into shared or provider-specific environment settings. See the [Environment snippets guide](docs/environment-snippets.md).
+
 **MCP Servers** — Connect external tools through each coding agent's native CLI-managed MCP configuration.
 
-**Tabs & Session Management** — Use multiple tabs in [single-pane mode](assets/main-chat-single-pane.png) or a persistent session manager beside the chat in [dual-pane mode](assets/main-chat-dual-pane.png).
+**Code Blocks & Diagrams** — Copy code, view Mermaid diagrams, and choose which fence languages installed plugins render in chat. See the [Code blocks guide](docs/chat-code-blocks.md).
+
+**Tabs & Session Management** — Use multiple tabs in [single-pane mode](assets/main-chat-single-pane.png) or a persistent session manager beside the chat in [dual-pane mode](assets/main-chat-dual-pane.png). In single-pane mode, bind hotkeys to **Next conversation tab** and **Previous conversation tab** to cycle through tabs; both wrap at the end of the tab list. See the [Session history guide](docs/session-history.md) for session actions, forks, rewind and Pi branches. Enable **Show conversation title in Obsidian tabs** under UI preferences to identify the active conversation by its title and project icon in Obsidian’s own tab and pane header. This is off by default; a blank draft uses its project name or “New Chat”.
 
 **Plugin API (experimental)** — Let other Obsidian plugins send prompts to sessions, stop them and read their replies. See the [Plugin API guide](docs/plugin-api.md).
 
@@ -46,7 +52,7 @@ Open Claudian interface from the ribbon icon or command palette. Everything work
 ## Requirements
 
 - At least one of the following harnesses:
-  - [Antigravity CLI](https://antigravity.google/product/antigravity-cli)
+  - [Antigravity CLI](https://antigravity.google/product/antigravity-cli) ([setup and provider differences](docs/antigravity.md))
   - [Claude Code](https://code.claude.com/docs/en/overview)
   - [Codex](https://github.com/openai/codex)
   - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)

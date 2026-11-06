@@ -455,6 +455,10 @@
       "name": "Claudian 应该如何称呼你？",
       "desc": "用于个性化问候的用户名（留空使用通用问候）"
     },
+    "autoLinkActiveNote": {
+      "name": "新聊天自动关联活动笔记",
+      "desc": "新聊天将活动笔记设为关联内容。关闭后，可在欢迎界面手动选择关联内容。"
+    },
     "excludedTags": {
       "name": "排除的标签",
       "desc": "包含这些标签的笔记不会自动加载为上下文（每行一个，不带 #）"
@@ -573,6 +577,10 @@
     "enableAutoScroll": {
       "name": "流式传输时自动滚动",
       "desc": "在 Claude 流式传输响应时自动滚动到底部。禁用后将停留在顶部，从头开始阅读。"
+    },
+    "showConversationTitleInWorkspace": {
+      "name": "在 Obsidian 标签页中显示对话标题",
+      "desc": "在 Obsidian 标签页和窗格标题中使用当前对话标题及项目图标。关闭后保留固定的 Claudian 名称和图标。"
     },
     "showMessageTimestamps": {
       "name": "显示消息时间戳",

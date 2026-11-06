@@ -22,6 +22,7 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   titleGenerationLocale: '',
   titleGenerationModel: '',
 
+  autoLinkActiveNote: true,
   excludedTags: [],
   mediaFolder: '',
   systemPrompt: '',
@@ -52,6 +53,7 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
 
   enableAutoScroll: true,
   showMessageTimestamps: false,
+  showConversationTitleInWorkspace: false,
   deferMathRenderingDuringStreaming: true,
   pluginRenderedFenceLanguages: [],
   expandFileEditsByDefault: false,

@@ -122,6 +122,8 @@ export interface ClaudianSettings {
   titleGenerationModel: string;
 
   // Content settings
+  /** New drafts automatically link the active note; explicit selection remains available. */
+  autoLinkActiveNote: boolean;
   excludedTags: string[];
   mediaFolder: string;
   systemPrompt: string;
@@ -157,6 +159,8 @@ export interface ClaudianSettings {
   // UI preferences
   enableAutoScroll: boolean;
   showMessageTimestamps?: boolean;
+  /** Use the active conversation/project in Obsidian workspace chrome; off by default. */
+  showConversationTitleInWorkspace?: boolean;
   deferMathRenderingDuringStreaming: boolean;
   /** Fence languages dispatched to registered plugin code block processors in chat. */
   pluginRenderedFenceLanguages: string[];

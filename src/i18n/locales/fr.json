@@ -455,6 +455,10 @@
       "name": "Comment Claudian doit-il vous appeler ?",
       "desc": "Votre nom pour les salutations personnalisées (laisser vide pour les salutations génériques)"
     },
+    "autoLinkActiveNote": {
+      "name": "Lier automatiquement la note active aux nouvelles conversations",
+      "desc": "Les nouvelles conversations utilisent la note active comme contenu lié. Désactivez cette option pour choisir le contenu manuellement sur l’écran d’accueil."
+    },
     "excludedTags": {
       "name": "Tags exclus",
       "desc": "Les notes avec ces tags ne seront pas chargées automatiquement comme contexte (un par ligne, sans #)"
@@ -573,6 +577,10 @@
     "enableAutoScroll": {
       "name": "Défilement automatique pendant le streaming",
       "desc": "Défiler automatiquement vers le bas pendant que Claude diffuse les réponses. Désactiver pour rester en haut et lire depuis le début."
+    },
+    "showConversationTitleInWorkspace": {
+      "name": "Afficher le titre de la conversation dans les onglets Obsidian",
+      "desc": "Utiliser le titre de la conversation active et l’icône du projet dans l’onglet Obsidian et l’en-tête du panneau. Désactivé, le nom et l’icône fixes de Claudian sont conservés."
     },
     "showMessageTimestamps": {
       "name": "Afficher les horodatages des messages",

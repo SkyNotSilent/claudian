@@ -455,6 +455,10 @@
       "name": "What should Claudian call you?",
       "desc": "Your name for personalized greetings (leave empty for generic greetings)"
     },
+    "autoLinkActiveNote": {
+      "name": "Automatically link active note in new chats",
+      "desc": "New chats start with the active note as Linked content. Turn this off to select Linked content manually on the welcome screen."
+    },
     "excludedTags": {
       "name": "Excluded tags",
       "desc": "Notes with these tags will not auto-load as context (one per line, without #)"
@@ -573,6 +577,10 @@
     "enableAutoScroll": {
       "name": "Auto-scroll during streaming",
       "desc": "Automatically scroll to the bottom as Claude streams responses. Disable to stay at the top and read from the beginning."
+    },
+    "showConversationTitleInWorkspace": {
+      "name": "Show conversation title in Obsidian tabs",
+      "desc": "Use the active conversation's title and project icon in the Obsidian tab and pane header. Off keeps the fixed Claudian name and icon."
     },
     "showMessageTimestamps": {
       "name": "Show message timestamps",
